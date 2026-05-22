@@ -177,49 +177,107 @@ class MainActivity : ComponentActivity() {
 
     private suspend fun seedMockCameras() {
         val defaultYaml = """
+            version: 0.18.0
+
             mqtt:
               host: 192.168.1.10
               port: 1883
-            
+
+            detect:
+              width: 640
+              height: 360
+              fps: 5
+
+            objects:
+              track:
+                - person
+                - car
+                - bird
+
             cameras:
               front_camera:
                 ffmpeg:
                   inputs:
-                    - path: rtsp://admin:passwd@192.168.1.33:554/live/ch0
+                    - path: rtsp://root:3d9PBN2jqOvE@192.168.1.33/stream=0
                       roles:
                         - detect
-                detect:
-                  width: 640
-                  height: 360
-                  fps: 5
-                motion:
-                  threshold: 2
-            
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
+
+              work_camera:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://10.50.0.63:8554/stream
+                      roles:
+                        - detect
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 0.5
+                snapshots:
+                  enabled: true
+                      
+              work_room:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://10.50.0.243:8554/stream
+                      roles:
+                        - detect
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 0.5
+                snapshots:
+                  enabled: true
+
+              stairway_camera:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://root:3d9PBN2jqOvE@192.168.1.34/stream=0
+                      roles:
+                        - detect
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
+              
               back_garden:
                 ffmpeg:
                   inputs:
                     - path: rtsp://admin:manupa@192.168.1.20:554/live/ch0
                       roles:
                         - detect
-                detect:
-                  width: 640
-                  height: 360
-                  fps: 5
-                motion:
-                  threshold: 2
-            
-              local_sensor:
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
+
+              kitchen_camera:
                 ffmpeg:
                   inputs:
-                    - path: ""
+                    - path: rtsp://admin:manupa@192.168.1.17:554/live/ch0
                       roles:
                         - detect
-                detect:
-                  width: 640
-                  height: 480
-                  fps: 10
-                motion:
-                  threshold: 2
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
         """.trimIndent()
 
         nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = defaultYaml))
