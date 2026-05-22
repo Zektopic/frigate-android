@@ -9,6 +9,7 @@ import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.request.receiveText
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.coroutines.CoroutineScope
@@ -42,6 +43,38 @@ class EmbeddedWebServer(
                             call.respondText(getWebConsoleHtml(), ContentType.Text.Html)
                         }
 
+                        // API config GET endpoint
+                        get("/api/config") {
+                            val config = nvrDao.getSystemConfig()
+                            val yamlString = config?.configYaml ?: ""
+                            call.respondText(yamlString, ContentType.Text.Plain)
+                        }
+
+                        // API config POST endpoint
+                        post("/api/config") {
+                            val yamlString = call.receiveText()
+                            try {
+                                // Validate and parse the YAML
+                                val cameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlString)
+                                
+                                // Update database
+                                nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlString))
+                                
+                                // Re-seed cameras database
+                                val existingCameras = nvrDao.getAllCameraConfigs()
+                                for (existing in existingCameras) {
+                                    nvrDao.deleteCameraConfig(existing)
+                                }
+                                for (camera in cameras) {
+                                    nvrDao.insertCameraConfig(camera)
+                                }
+                                
+                                call.respondText("{\"status\":\"success\",\"message\":\"Configuration updated and streams restarted.\"}", ContentType.Application.Json)
+                            } catch (e: Exception) {
+                                call.respond(HttpStatusCode.BadRequest, "{\"status\":\"error\",\"message\":\"" + (e.message ?: "Invalid YAML") + "\"}")
+                            }
+                        }
+
                         // API status endpoint
                         get("/api/status") {
                             val activeCameras = nvrDao.getAllCameraConfigs()
@@ -60,7 +93,7 @@ class EmbeddedWebServer(
                         // API events listings endpoint
                         get("/api/events") {
                             val events = nvrDao.getPagedEvents(50, 0)
-                            val jsonArray = events.joinToString(",", prefix = "[", suffix = "]") { event ->
+                            val jsonArray = events.joinToString(",", prefix = "[", postfix = "]") { event ->
                                 """
                                     {
                                         "id": ${event.id},
@@ -325,10 +358,10 @@ class EmbeddedWebServer(
                                         container.innerHTML += `
                                             <div class="event-item">
                                                 <div>
-                                                    <div class="event-label">${event.label.toUpperCase()} detected</div>
-                                                    <div class="event-details">Camera: ${event.camera} • ${time}</div>
+                                                    <div class="event-label">${'$'}{event.label.toUpperCase()} detected</div>
+                                                    <div class="event-details">Camera: ${'$'}{event.camera} • ${'$'}{time}</div>
                                                 </div>
-                                                <div class="event-confidence">${Math.round(event.confidence * 100)}%</div>
+                                                <div class="event-confidence">${'$'}{Math.round(event.confidence * 100)}%</div>
                                             </div>
                                         `;
                                     });

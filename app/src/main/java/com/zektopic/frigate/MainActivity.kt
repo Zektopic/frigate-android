@@ -28,13 +28,14 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var nvrDao: NvrDao
 
-    override fun onCreate(Bundle savedInstanceState) {
+    override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         setContent {
             FrigateAndroidTheme {
                 val cameraConfigs by nvrDao.getAllCameraConfigsFlow().collectAsState(initial = emptyList())
                 val events by nvrDao.getAllEventsFlow().collectAsState(initial = emptyList())
+                val systemConfig by nvrDao.getSystemConfigFlow().collectAsState(initial = null)
                 var isServiceRunning by remember { mutableStateOf(false) }
 
                 // Periodically check if background service is running
@@ -48,6 +49,18 @@ class MainActivity : ComponentActivity() {
                 DashboardScreen(
                     cameraConfigs = cameraConfigs,
                     events = events,
+                    systemConfig = systemConfig,
+                    onSaveConfig = { yamlText ->
+                        val parsedCameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlText)
+                        nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlText))
+                        val existing = nvrDao.getAllCameraConfigs()
+                        for (c in existing) {
+                            nvrDao.deleteCameraConfig(c)
+                        }
+                        for (c in parsedCameras) {
+                            nvrDao.insertCameraConfig(c)
+                        }
+                    },
                     onAddMockCamera = {
                         lifecycleScope.launch(Dispatchers.IO) {
                             seedMockCameras()
@@ -94,40 +107,62 @@ class MainActivity : ComponentActivity() {
     }
 
     private suspend fun seedMockCameras() {
-        // Mock feeds reflecting typical configurations
-        val frontCamera = CameraConfigEntity(
-            id = "front_camera",
-            name = "Front Driveway",
-            rtspUrl = "rtsp://admin:passwd@192.168.1.33:554/live/ch0",
-            isEnabled = true,
-            detectWidth = 640,
-            detectHeight = 360,
-            fps = 5
-        )
+        val defaultYaml = """
+            mqtt:
+              host: 192.168.1.10
+              port: 1883
+            
+            cameras:
+              front_camera:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://admin:passwd@192.168.1.33:554/live/ch0
+                      roles:
+                        - detect
+                detect:
+                  width: 640
+                  height: 360
+                  fps: 5
+                motion:
+                  threshold: 2
+            
+              back_garden:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://admin:manupa@192.168.1.20:554/live/ch0
+                      roles:
+                        - detect
+                detect:
+                  width: 640
+                  height: 360
+                  fps: 5
+                motion:
+                  threshold: 2
+            
+              local_sensor:
+                ffmpeg:
+                  inputs:
+                    - path: ""
+                      roles:
+                        - detect
+                detect:
+                  width: 640
+                  height: 480
+                  fps: 10
+                motion:
+                  threshold: 2
+        """.trimIndent()
 
-        val backyardCamera = CameraConfigEntity(
-            id = "back_garden",
-            name = "Back Garden",
-            rtspUrl = "rtsp://admin:manupa@192.168.1.20:554/live/ch0",
-            isEnabled = true,
-            detectWidth = 640,
-            detectHeight = 360,
-            fps = 5
-        )
+        nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = defaultYaml))
 
-        val localDeviceCamera = CameraConfigEntity(
-            id = "local_sensor",
-            name = "Android Built-in Cam",
-            rtspUrl = "", // Empty indicates physical sensor integration
-            isEnabled = true,
-            detectWidth = 640,
-            detectHeight = 480,
-            fps = 10
-        )
-
-        nvrDao.insertCameraConfig(frontCamera)
-        nvrDao.insertCameraConfig(backyardCamera)
-        nvrDao.insertCameraConfig(localDeviceCamera)
+        val parsedCameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(defaultYaml)
+        val existing = nvrDao.getAllCameraConfigs()
+        for (c in existing) {
+            nvrDao.deleteCameraConfig(c)
+        }
+        for (camera in parsedCameras) {
+            nvrDao.insertCameraConfig(camera)
+        }
 
         // Seed some mock historical events
         val event1 = EventEntity(

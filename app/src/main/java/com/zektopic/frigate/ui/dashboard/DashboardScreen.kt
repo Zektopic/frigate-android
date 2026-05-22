@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +35,8 @@ import kotlinx.coroutines.launch
 fun DashboardScreen(
     cameraConfigs: List<CameraConfigEntity>,
     events: List<EventEntity>,
+    systemConfig: com.zektopic.frigate.data.SystemConfigEntity?,
+    onSaveConfig: suspend (String) -> Unit,
     onAddMockCamera: () -> Unit,
     onTriggerTestNotification: () -> Unit,
     onStartNvrService: () -> Unit,
@@ -126,7 +129,7 @@ fun DashboardScreen(
                 }
             )
 
-            // Tabs layout: Cameras vs Events Log
+            // Tabs layout: Cameras vs Events Log vs Config
             TabRow(
                 selectedTabIndex = selectedTab,
                 containerColor = CardCarbon,
@@ -151,18 +154,26 @@ fun DashboardScreen(
                     onClick = { selectedTab = 1 },
                     text = { Text("EVENTS LOG", fontWeight = FontWeight.Bold, color = if (selectedTab == 1) CyberCyan else SoftGray) }
                 )
+                Tab(
+                    selected = selectedTab == 2,
+                    onClick = { selectedTab = 2 },
+                    text = { Text("CONFIG", fontWeight = FontWeight.Bold, color = if (selectedTab == 2) CyberCyan else SoftGray) }
+                )
             }
 
             // Main body content switching based on tabs
             Box(modifier = Modifier.weight(1f)) {
-                if (selectedTab == 0) {
-                    CamerasTabContent(
+                when (selectedTab) {
+                    0 -> CamerasTabContent(
                         cameraConfigs = cameraConfigs,
                         isServiceRunning = isServiceRunning,
                         onAddMockCamera = onAddMockCamera
                     )
-                } else {
-                    EventsTabContent(events = events)
+                    1 -> EventsTabContent(events = events)
+                    2 -> ConfigTabContent(
+                        systemConfig = systemConfig,
+                        onSaveConfig = onSaveConfig
+                    )
                 }
             }
         }
@@ -632,6 +643,198 @@ fun EventListItem(event: EventEntity) {
                     fontSize = 10.sp,
                     color = SoftGray
                 )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ConfigTabContent(
+    systemConfig: com.zektopic.frigate.data.SystemConfigEntity?,
+    onSaveConfig: suspend (String) -> Unit
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    var yamlText by remember(systemConfig) { mutableStateOf(systemConfig?.configYaml ?: "") }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isSaving by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Error Message Banner
+        errorMessage?.let { error ->
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, ErrorRed, RoundedCornerShape(12.dp)),
+                colors = CardDefaults.cardColors(containerColor = ErrorRed.copy(alpha = 0.1f)),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = "Error Icon",
+                        tint = ErrorRed
+                    )
+                    Text(
+                        text = error,
+                        color = LightWhite,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
+        // Title and description
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, SlateBorder, RoundedCornerShape(12.dp)),
+            colors = CardDefaults.cardColors(containerColor = CardCarbon),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = "FRIGATE YAML CONFIGURATION",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = CyberCyan
+                )
+                Text(
+                    text = "Paste or edit your configuration. Saving will update the dynamic camera list, reload background engines, and apply detect sizes and FPS settings.",
+                    fontSize = 11.sp,
+                    color = SoftGray
+                )
+            }
+        }
+
+        // Editor TextField
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(DeepCharcoal, RoundedCornerShape(12.dp))
+                .border(1.dp, SlateBorder, RoundedCornerShape(12.dp))
+        ) {
+            OutlinedTextField(
+                value = yamlText,
+                onValueChange = {
+                    yamlText = it
+                    errorMessage = null
+                },
+                modifier = Modifier
+                    .fillMaxSize(),
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    color = LightWhite
+                ),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Color.Transparent,
+                    unfocusedBorderColor = Color.Transparent,
+                    cursorColor = CyberCyan,
+                    focusedTextColor = LightWhite,
+                    unfocusedTextColor = LightWhite
+                ),
+                placeholder = {
+                    Text(
+                        text = "# Paste Frigate configuration here...",
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                        fontSize = 12.sp,
+                        color = SoftGray
+                    )
+                }
+            )
+        }
+
+        // Actions
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OutlinedButton(
+                onClick = {
+                    yamlText = systemConfig?.configYaml ?: ""
+                    errorMessage = null
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .border(1.dp, SlateBorder, RoundedCornerShape(8.dp)),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = SoftGray)
+            ) {
+                Text(
+                    text = "RESET",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp
+                )
+            }
+
+            Button(
+                onClick = {
+                    errorMessage = null
+                    try {
+                        if (yamlText.isBlank()) {
+                            errorMessage = "Configuration cannot be empty"
+                            return@Button
+                        }
+                        
+                        // Parse local check
+                        val parsed = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlText)
+                        if (parsed.isEmpty()) {
+                            errorMessage = "Warning: No cameras parsed. Check your configuration format."
+                            return@Button
+                        }
+                        
+                        isSaving = true
+                        coroutineScope.launch {
+                            try {
+                                onSaveConfig(yamlText)
+                                Toast.makeText(context, "Configuration Saved!", Toast.LENGTH_SHORT).show()
+                            } catch (e: Exception) {
+                                errorMessage = "Database Error: ${e.localizedMessage}"
+                            } finally {
+                                isSaving = false
+                            }
+                        }
+                    } catch (e: Exception) {
+                        errorMessage = "YAML Error: ${e.localizedMessage}"
+                    }
+                },
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CyberCyan,
+                    contentColor = DarkVoid
+                ),
+                enabled = !isSaving
+            ) {
+                if (isSaving) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        color = DarkVoid,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Text(
+                        text = "SAVE CONFIG",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                }
             }
         }
     }

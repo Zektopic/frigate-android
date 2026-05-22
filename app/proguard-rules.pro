@@ -4,7 +4,7 @@
 -keep class * extends androidx.room.RoomDatabase
 -dontwarn androidx.room.limit.**
 
-# Keep TensorFlow Lite elements
+# Keep TensorFlow Lite / LiteRT elements
 -keep class org.tensorflow.lite.** { *; }
 -dontwarn org.tensorflow.lite.**
 

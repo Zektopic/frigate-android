@@ -60,22 +60,29 @@ class NvrService : Service(), LifecycleOwner {
         // Show persistent status notification to run in background
         startForeground(1, createStatusNotification("Initializing NVR streams..."))
 
-        // Query database configurations and launch streams
+        // Observe database configurations flow and launch/reload streams dynamically
         serviceScope.launch {
             try {
-                val cameras = nvrDao.getAllCameraConfigs()
-                val activeCameras = cameras.filter { it.isEnabled }
-                
-                withContext(Dispatchers.Main) {
-                    if (activeCameras.isEmpty()) {
-                        updateNotification("No active cameras configured. Configure in App UI.")
-                    } else {
-                        updateNotification("Monitoring ${activeCameras.size} active camera stream(s)")
-                        startActiveStreams(activeCameras)
+                nvrDao.getAllCameraConfigsFlow().collect { cameras ->
+                    val activeCameras = cameras.filter { it.isEnabled }
+                    withContext(Dispatchers.Main) {
+                        if (activeCameras.isEmpty()) {
+                            updateNotification("No active cameras configured. Configure in App UI.")
+                            synchronized(activeIngesters) {
+                                for (ingester in activeIngesters.values) {
+                                    ingester.stop()
+                                }
+                                activeIngesters.clear()
+                                motionDetectors.clear()
+                            }
+                        } else {
+                            updateNotification("Monitoring ${activeCameras.size} active camera stream(s)")
+                            startActiveStreams(activeCameras)
+                        }
                     }
                 }
             } catch (e: Exception) {
-                Log.e(tag, "Failed to load camera configurations on start", e)
+                Log.e(tag, "Failed to load camera configurations flow in service", e)
                 withContext(Dispatchers.Main) {
                     updateNotification("Error starting streams: ${e.message}")
                 }
@@ -153,11 +160,12 @@ class NvrService : Service(), LifecycleOwner {
         val detections = objectDetector?.detectObjects(bitmap, confidenceThreshold = 0.5f) ?: emptyList()
         if (detections.isEmpty()) return
 
-        // 3. Object detected! Save the events and fire alerts
+        // 3. Object detected! Fire alerts (Event database logging disabled for now)
         for (detection in detections) {
             Log.i(tag, "[$cameraId] AI Detected: ${detection.label} (${detection.confidence * 100}%) at ${detection.boundingBox}")
             
-            // Insert event into Room database
+            /*
+            // Insert event into Room database (Disabled for stability)
             val eventId = nvrDao.insertEvent(
                 com.zektopic.frigate.data.EventEntity(
                     cameraId = cameraId,
@@ -169,6 +177,7 @@ class NvrService : Service(), LifecycleOwner {
                     zone = null
                 )
             )
+            */
 
             // Trigger system alerts for high confidence key targets (person, car)
             if (detection.label == "person" || detection.label == "car") {

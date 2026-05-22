@@ -50,6 +50,9 @@ android {
             excludes += "/META-INF/INDEX.LIST"
             excludes += "/META-INF/io.netty.versions.properties"
         }
+        jniLibs {
+            useLegacyPackaging = false
+        }
     }
 }
 
@@ -70,7 +73,7 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.7.7")
 
     // CameraX for Local Camera support
-    val cameraVersion = "1.3.1"
+    val cameraVersion = "1.4.2"
     implementation("androidx.camera:camera-core:$cameraVersion")
     implementation("androidx.camera:camera-camera2:$cameraVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraVersion")
@@ -79,10 +82,10 @@ dependencies {
     // LibVLC for Android RTSP streams
     implementation("org.videolan.android:libvlc-all:3.6.0")
 
-    // TensorFlow Lite for Object Detection
-    implementation("org.tensorflow:tensorflow-lite:2.14.0")
-    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
-    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
+    // LiteRT (formerly TensorFlow Lite) for Object Detection
+    implementation("com.google.ai.edge.litert:litert:1.4.2")
+    implementation("com.google.ai.edge.litert:litert-gpu:1.4.2")
+    implementation("com.google.ai.edge.litert:litert-gpu-api:1.4.2")
 
     // Room Database for local Events log & Settings
     val roomVersion = "2.6.1"
@@ -101,6 +104,9 @@ dependencies {
     implementation("io.ktor:ktor-server-netty:$ktorVersion")
     implementation("io.ktor:ktor-server-content-negotiation:$ktorVersion")
     implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
+
+    // YAML parsing
+    implementation("org.yaml:snakeyaml:2.2")
 
     // Testing
     testImplementation("junit:junit:4.13.2")
