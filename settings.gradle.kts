@@ -10,8 +10,6 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // VLC repository for the VLC Android SDK
-        maven { url = java.net.URI("https://artifacts.videolan.org/android/") }
     }
 }
 

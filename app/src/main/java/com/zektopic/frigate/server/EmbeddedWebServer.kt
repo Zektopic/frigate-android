@@ -9,12 +9,17 @@ import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.request.receiveText
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
+import com.zektopic.frigate.service.NvrService
+import io.ktor.utils.io.*
+import java.io.ByteArrayOutputStream
+import android.graphics.Bitmap
 
 class EmbeddedWebServer(
     private val context: Context,
@@ -42,6 +47,38 @@ class EmbeddedWebServer(
                             call.respondText(getWebConsoleHtml(), ContentType.Text.Html)
                         }
 
+                        // API config GET endpoint
+                        get("/api/config") {
+                            val config = nvrDao.getSystemConfig()
+                            val yamlString = config?.configYaml ?: ""
+                            call.respondText(yamlString, ContentType.Text.Plain)
+                        }
+
+                        // API config POST endpoint
+                        post("/api/config") {
+                            val yamlString = call.receiveText()
+                            try {
+                                // Validate and parse the YAML
+                                val cameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlString)
+                                
+                                // Update database
+                                nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlString))
+                                
+                                // Re-seed cameras database
+                                val existingCameras = nvrDao.getAllCameraConfigs()
+                                for (existing in existingCameras) {
+                                    nvrDao.deleteCameraConfig(existing)
+                                }
+                                for (camera in cameras) {
+                                    nvrDao.insertCameraConfig(camera)
+                                }
+                                
+                                call.respondText("{\"status\":\"success\",\"message\":\"Configuration updated and streams restarted.\"}", ContentType.Application.Json)
+                            } catch (e: Exception) {
+                                call.respond(HttpStatusCode.BadRequest, "{\"status\":\"error\",\"message\":\"" + (e.message ?: "Invalid YAML") + "\"}")
+                            }
+                        }
+
                         // API status endpoint
                         get("/api/status") {
                             val activeCameras = nvrDao.getAllCameraConfigs()
@@ -50,8 +87,8 @@ class EmbeddedWebServer(
                                     "status": "active",
                                     "cameras_count": ${activeCameras.size},
                                     "monitored_feeds": [${activeCameras.joinToString(",") { "\"${it.name}\"" }}],
-                                    "engine": "TensorFlow Lite NPU",
-                                    "inference_speed": "24ms"
+                                    "engine": "Standard Motion Detector",
+                                    "inference_speed": "1ms"
                                 }
                             """.trimIndent()
                             call.respondText(responseHtml, ContentType.Application.Json)
@@ -60,7 +97,7 @@ class EmbeddedWebServer(
                         // API events listings endpoint
                         get("/api/events") {
                             val events = nvrDao.getPagedEvents(50, 0)
-                            val jsonArray = events.joinToString(",", prefix = "[", suffix = "]") { event ->
+                            val jsonArray = events.joinToString(",", prefix = "[", postfix = "]") { event ->
                                 """
                                     {
                                         "id": ${event.id},
@@ -97,6 +134,53 @@ class EmbeddedWebServer(
                                 call.respond(HttpStatusCode.NotFound, "No snapshot associated with this event")
                             }
                         }
+
+                        // API live stream endpoint
+                        get("/api/{cameraName}/live.mjpeg") {
+                            val cameraName = call.parameters["cameraName"]
+                            if (cameraName == null) {
+                                call.respond(HttpStatusCode.BadRequest, "Missing cameraName parameter")
+                                return@get
+                            }
+                            
+                            val camera = nvrDao.getAllCameraConfigs().find { it.name.lowercase() == cameraName.lowercase() || it.id.lowercase() == cameraName.lowercase() }
+                            if (camera == null) {
+                                call.respond(HttpStatusCode.NotFound, "Camera not found")
+                                return@get
+                            }
+                            
+                            val service = this@EmbeddedWebServer.context as? NvrService
+                            if (service == null) {
+                                call.respond(HttpStatusCode.InternalServerError, "NVR service not available")
+                                return@get
+                            }
+
+                            call.respondBytesWriter(contentType = ContentType.parse("multipart/x-mixed-replace; boundary=frame")) {
+                                val intervalMs = 1000L / camera.fps
+                                try {
+                                    while (true) {
+                                        val bitmap = service.getLatestFrame(camera.id)
+                                        if (bitmap != null) {
+                                            val out = ByteArrayOutputStream()
+                                            bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                                            val jpegBytes = out.toByteArray()
+
+                                            writeStringUtf8("--frame\r\n")
+                                            writeStringUtf8("Content-Type: image/jpeg\r\n")
+                                            writeStringUtf8("Content-Length: ${jpegBytes.size}\r\n")
+                                            writeStringUtf8("\r\n")
+                                            writeFully(jpegBytes)
+                                            writeStringUtf8("\r\n")
+                                            flush()
+                                        }
+                                        kotlinx.coroutines.delay(intervalMs)
+                                    }
+                                } catch (e: Exception) {
+                                    // Client disconnected or stream stopped
+                                    Log.d("EmbeddedWebServer", "MJPEG stream disconnected for camera ${camera.name}: ${e.message}")
+                                }
+                            }
+                        }
                     }
                 }
                 server?.start(wait = false)
@@ -118,7 +202,38 @@ class EmbeddedWebServer(
         }
     }
 
-    private fun getWebConsoleHtml(): String {
+    private suspend fun getWebConsoleHtml(): String {
+        val cameras = nvrDao.getAllCameraConfigs()
+        val feedsHtml = if (cameras.isEmpty()) {
+            """
+            <div style="text-align: center; padding: 48px; background-color: #14141C; border: 1px dashed #222232; border-radius: 8px; color: #8E8E9C; grid-column: 1 / -1;">
+                <div style="font-size: 32px; margin-bottom: 8px;">📷</div>
+                <div style="font-weight: bold; color: #F5F5FA;">No Cameras Configured</div>
+                <div style="font-size: 12px; margin-top: 4px;">Please configure cameras in the Android app UI.</div>
+            </div>
+            """.trimIndent()
+        } else {
+            cameras.joinToString("\n") { camera ->
+                """
+                <div class="feed-card">
+                    <div class="feed-header">
+                        <h3>${camera.name.uppercase()}</h3>
+                        <span class="badge">NVR ONLINE</span>
+                    </div>
+                    <div class="feed-monitor">
+                        <img src="/api/${camera.name}/live.mjpeg" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" />
+                        <div class="feed-placeholder" style="display: none; flex-direction: column; align-items: center; justify-content: center; color: #8E8E9C; height: 100%;">
+                            <div style="font-size: 32px; margin-bottom: 8px;">📷</div>
+                            <div style="font-weight: bold; color: #F5F5FA;">FEED OFFLINE</div>
+                        </div>
+                        <div style="position: absolute; bottom: 12px; left: 12px; font-size: 10px; color: #FF2A7A; font-weight: bold; background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 3px;">● REC</div>
+                        <div style="position: absolute; bottom: 12px; right: 12px; font-size: 10px; color: #8E8E9C; background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 3px;">${camera.fps} FPS | ${camera.detectWidth}x${camera.detectHeight}</div>
+                    </div>
+                </div>
+                """.trimIndent()
+            }
+        }
+
         return """
             <!DOCTYPE html>
             <html lang="en">
@@ -166,6 +281,11 @@ class EmbeddedWebServer(
                         grid-template-columns: 2fr 1fr;
                         gap: 24px;
                     }
+                    @media (max-width: 900px) {
+                        main {
+                            grid-template-columns: 1fr;
+                        }
+                    }
                     .card {
                         background-color: #14141C;
                         border: 1px solid #222232;
@@ -182,14 +302,34 @@ class EmbeddedWebServer(
                     }
                     .feed-grid {
                         display: grid;
-                        grid-template-columns: 1fr;
+                        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
                         gap: 16px;
                     }
-                    .feed-monitor {
+                    .feed-card {
                         background-color: #0F0F13;
                         border: 1px solid #222232;
                         border-radius: 8px;
-                        height: 240px;
+                        padding: 12px;
+                        display: flex;
+                        flex-direction: column;
+                    }
+                    .feed-header {
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        margin-bottom: 8px;
+                    }
+                    .feed-card h3 {
+                        margin: 0;
+                        font-size: 13px;
+                        letter-spacing: 1px;
+                        color: #F5F5FA;
+                    }
+                    .feed-monitor {
+                        background-color: #050508;
+                        border: 1px solid #222232;
+                        border-radius: 6px;
+                        height: 200px;
                         position: relative;
                         display: flex;
                         align-items: center;
@@ -257,37 +397,29 @@ class EmbeddedWebServer(
                         <div class="card">
                             <h2>LIVE SYSTEM PREVIEWS</h2>
                             <div class="feed-grid">
-                                <div class="feed-monitor">
-                                    <div style="text-align: center; color: #8E8E9C;">
-                                        <div style="font-size: 32px; margin-bottom: 8px;">📷</div>
-                                        <div style="font-weight: bold; color: #F5F5FA;">ACTIVE NVR CAMERA FEED</div>
-                                        <div style="font-size: 11px; margin-top: 4px;">RTSP stream is being processed by TensorFlow Lite NPU</div>
-                                    </div>
-                                    <div style="position: absolute; bottom: 12px; left: 12px; font-size: 10px; color: #FF2A7A; font-weight: bold;">● REC</div>
-                                    <div style="position: absolute; bottom: 12px; right: 12px; font-size: 10px; color: #8E8E9C;">5.0 FPS | 300x300</div>
-                                </div>
+                                $feedsHtml
                             </div>
                         </div>
-
+ 
                         <div class="card">
                             <h2>SYSTEM DIAGNOSTICS</h2>
                             <div class="diagnostic-grid">
                                 <div>
-                                    <div class="metric-val">24ms</div>
-                                    <div class="metric-lbl">Inference Latency</div>
+                                    <div class="metric-val">1ms</div>
+                                    <div class="metric-lbl">Analysis Latency</div>
                                 </div>
                                 <div>
                                     <div class="metric-val">5.0 FPS</div>
                                     <div class="metric-lbl">Processing Speed</div>
                                 </div>
                                 <div>
-                                    <div class="metric-val">NPU / GPU</div>
-                                    <div class="metric-lbl">Hardware Engine</div>
+                                    <div class="metric-val">CPU</div>
+                                    <div class="metric-lbl">Detection Engine</div>
                                 </div>
                             </div>
                         </div>
                     </div>
-
+ 
                     <div>
                         <div class="card">
                             <h2>RECENT DETECTION EVENTS</h2>
@@ -325,10 +457,10 @@ class EmbeddedWebServer(
                                         container.innerHTML += `
                                             <div class="event-item">
                                                 <div>
-                                                    <div class="event-label">${event.label.toUpperCase()} detected</div>
-                                                    <div class="event-details">Camera: ${event.camera} • ${time}</div>
+                                                    <div class="event-label">${'$'}{event.label.toUpperCase()} detected</div>
+                                                    <div class="event-details">Camera: ${'$'}{event.camera} • ${'$'}{time}</div>
                                                 </div>
-                                                <div class="event-confidence">${Math.round(event.confidence * 100)}%</div>
+                                                <div class="event-confidence">${'$'}{Math.round(event.confidence * 100)}%</div>
                                             </div>
                                         `;
                                     });

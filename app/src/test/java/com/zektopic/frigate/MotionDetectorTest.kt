@@ -4,14 +4,13 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import com.zektopic.frigate.ai.MotionDetector
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
-import org.junit.runner.RunWith
-import org.mockito.Mockito.*
+import org.mockito.ArgumentMatchers.anyBoolean
+import org.mockito.ArgumentMatchers.anyInt
+import org.mockito.Mockito.mock
+import org.mockito.Mockito.mockStatic
 import org.mockito.kotlin.any
-import org.mockito.kotlin.doReturn
-import org.mockito.kotlin.mock
 
 class MotionDetectorTest {
 
@@ -19,26 +18,36 @@ class MotionDetectorTest {
 
     @Before
     fun setUp() {
-        // Set motion change threshold to 1% for sensitive checks
         motionDetector = MotionDetector(thresholdPercentage = 0.01)
     }
 
     @Test
     fun testNoMotionDetectedForIdenticalFrames() {
-        val width = 32
-        val height = 32
+        val mockBitmap = mock(Bitmap::class.java)
         
-        // Create mock bitmap that returns standard values
-        val mockBitmap = mock<Bitmap> {
-            on { getPixel(any(), any()) } doReturn Color.BLACK
-        }
-        
-        // The first frame establishes the baseline, always returning false
-        val firstResult = motionDetector.detectMotion(mockBitmap)
-        assertFalse("First frame should serve as baseline and return false", firstResult)
+        mockStatic(Bitmap::class.java).use { mockedBitmap ->
+            mockedBitmap.`when`<Bitmap> { 
+                Bitmap.createScaledBitmap(
+                    org.mockito.ArgumentMatchers.any(Bitmap::class.java), 
+                    org.mockito.ArgumentMatchers.anyInt(), 
+                    org.mockito.ArgumentMatchers.anyInt(), 
+                    org.mockito.ArgumentMatchers.anyBoolean()
+                ) 
+            }.thenReturn(mockBitmap)
 
-        // The second frame has identical pixels, should return false (no motion)
-        val secondResult = motionDetector.detectMotion(mockBitmap)
-        assertFalse("Identical consecutive frames should report no motion", secondResult)
+            mockStatic(Color::class.java).use { mockedColor ->
+                mockedColor.`when`<Int> { Color.red(org.mockito.ArgumentMatchers.anyInt()) }.thenReturn(0)
+                mockedColor.`when`<Int> { Color.green(org.mockito.ArgumentMatchers.anyInt()) }.thenReturn(0)
+                mockedColor.`when`<Int> { Color.blue(org.mockito.ArgumentMatchers.anyInt()) }.thenReturn(0)
+
+                // First frame establishes the baseline
+                val firstResult = motionDetector.detectMotion(mockBitmap)
+                assertFalse("First frame should serve as baseline and return false", firstResult)
+
+                // Second frame has identical pixels (all 0 in mock)
+                val secondResult = motionDetector.detectMotion(mockBitmap)
+                assertFalse("Identical consecutive frames should report no motion", secondResult)
+            }
+        }
     }
 }

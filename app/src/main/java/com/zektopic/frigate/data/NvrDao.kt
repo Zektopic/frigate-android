@@ -37,4 +37,14 @@ interface NvrDao {
 
     @Query("SELECT COUNT(*) FROM nvr_events")
     fun getEventCountFlow(): Flow<Long>
+
+    // System Config Queries
+    @Query("SELECT * FROM system_config WHERE id = 1")
+    fun getSystemConfigFlow(): Flow<SystemConfigEntity?>
+
+    @Query("SELECT * FROM system_config WHERE id = 1")
+    suspend fun getSystemConfig(): SystemConfigEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSystemConfig(config: SystemConfigEntity)
 }
