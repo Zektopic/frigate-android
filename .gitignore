@@ -1,0 +1,25 @@
+# Built variants
+**/build
+*.apk
+*.aar
+
+# Gradle files
+.gradle
+/local.properties
+/.gradle
+/captures
+.externalNativeBuild
+
+# Android Studio / IDEA
+.idea
+*.iml
+*.iws
+*.ipr
+.navigation
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
