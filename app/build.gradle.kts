@@ -82,10 +82,6 @@ dependencies {
     // LibVLC for Android RTSP streams
     implementation("org.videolan.android:libvlc-all:3.6.0")
 
-    // LiteRT (formerly TensorFlow Lite) for Object Detection
-    implementation("com.google.ai.edge.litert:litert:1.4.2")
-    implementation("com.google.ai.edge.litert:litert-gpu:1.4.2")
-    implementation("com.google.ai.edge.litert:litert-gpu-api:1.4.2")
 
     // Room Database for local Events log & Settings
     val roomVersion = "2.6.1"

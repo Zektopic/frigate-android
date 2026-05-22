@@ -30,9 +30,9 @@ class NvrService : Service(), LifecycleOwner {
     private val activeIngesters = mutableMapOf<String, StreamIngester>()
     private val lifecycleRegistry = LifecycleRegistry(this)
 
-    // Motion and AI Object Detection variables
+    // Motion variables
     private val motionDetectors = mutableMapOf<String, com.zektopic.frigate.ai.MotionDetector>()
-    private var objectDetector: com.zektopic.frigate.ai.ObjectDetector? = null
+    private val lastEventTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     // Embedded Ktor Web Server
     private var webServer: com.zektopic.frigate.server.EmbeddedWebServer? = null
@@ -44,14 +44,11 @@ class NvrService : Service(), LifecycleOwner {
         super.onCreate()
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
         
-        // Initialize AI Object Detector
-        objectDetector = com.zektopic.frigate.ai.ObjectDetector(this)
-
         // Initialize and start embedded Ktor web server
         webServer = com.zektopic.frigate.server.EmbeddedWebServer(this, nvrDao)
         webServer?.start()
 
-        Log.i(tag, "NVR Foreground Service created. AI engine and Web Server initialized.")
+        Log.i(tag, "NVR Foreground Service created. Web Server initialized.")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -110,10 +107,9 @@ class NvrService : Service(), LifecycleOwner {
             activeIngesters.clear()
         }
 
-        // Release AI detector resources
-        objectDetector?.close()
-        objectDetector = null
+        // Release resources
         motionDetectors.clear()
+        lastEventTime.clear()
 
         // Stop web server
         webServer?.stop()
@@ -156,33 +152,27 @@ class NvrService : Service(), LifecycleOwner {
         val hasMotion = motionDetector.detectMotion(bitmap)
         if (!hasMotion) return
 
-        // 2. Motion occurred! Trigger the hardware-accelerated TFLite Object Detector
-        val detections = objectDetector?.detectObjects(bitmap, confidenceThreshold = 0.5f) ?: emptyList()
-        if (detections.isEmpty()) return
-
-        // 3. Object detected! Fire alerts (Event database logging disabled for now)
-        for (detection in detections) {
-            Log.i(tag, "[$cameraId] AI Detected: ${detection.label} (${detection.confidence * 100}%) at ${detection.boundingBox}")
+        // 2. Throttle event logging to once every 10 seconds per camera
+        val currentTime = System.currentTimeMillis()
+        val lastTime = lastEventTime[cameraId] ?: 0L
+        if (currentTime - lastTime >= 10000L) {
+            lastEventTime[cameraId] = currentTime
             
-            /*
-            // Insert event into Room database (Disabled for stability)
-            val eventId = nvrDao.insertEvent(
+            // Insert event into local database
+            nvrDao.insertEvent(
                 com.zektopic.frigate.data.EventEntity(
                     cameraId = cameraId,
-                    label = detection.label,
-                    confidence = detection.confidence,
-                    timestamp = System.currentTimeMillis(),
-                    snapshotPath = null, // Path to JPG
-                    videoPath = null,    // Path to MP4
-                    zone = null
+                    label = "motion",
+                    confidence = 1.0f,
+                    timestamp = currentTime,
+                    snapshotPath = null,
+                    videoPath = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+                    zone = "Main Zone"
                 )
             )
-            */
 
-            // Trigger system alerts for high confidence key targets (person, car)
-            if (detection.label == "person" || detection.label == "car") {
-                triggerSystemAlert(cameraId, detection.label, detection.confidence)
-            }
+            // Trigger system alerts for motion detection
+            triggerSystemAlert(cameraId, "motion", 1.0f)
         }
     }
 
@@ -195,10 +185,10 @@ class NvrService : Service(), LifecycleOwner {
             if (permissionState != android.content.pm.PackageManager.PERMISSION_GRANTED) return
         }
 
-        val text = "A ${label.uppercase()} was detected on camera '$cameraId' (${(confidence * 100).toInt()}% confidence)."
+        val text = "Motion was detected on camera '$cameraId'."
         val builder = androidx.core.app.NotificationCompat.Builder(this, FrigateApp.CHANNEL_ALERTS)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setContentTitle("Frigate Alert: ${label.uppercase()}")
+            .setContentTitle("Frigate Alert: Motion Detected")
             .setContentText(text)
             .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)

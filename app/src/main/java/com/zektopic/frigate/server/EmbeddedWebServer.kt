@@ -83,8 +83,8 @@ class EmbeddedWebServer(
                                     "status": "active",
                                     "cameras_count": ${activeCameras.size},
                                     "monitored_feeds": [${activeCameras.joinToString(",") { "\"${it.name}\"" }}],
-                                    "engine": "TensorFlow Lite NPU",
-                                    "inference_speed": "24ms"
+                                    "engine": "Standard Motion Detector",
+                                    "inference_speed": "1ms"
                                 }
                             """.trimIndent()
                             call.respondText(responseHtml, ContentType.Application.Json)
@@ -294,28 +294,28 @@ class EmbeddedWebServer(
                                     <div style="text-align: center; color: #8E8E9C;">
                                         <div style="font-size: 32px; margin-bottom: 8px;">📷</div>
                                         <div style="font-weight: bold; color: #F5F5FA;">ACTIVE NVR CAMERA FEED</div>
-                                        <div style="font-size: 11px; margin-top: 4px;">RTSP stream is being processed by TensorFlow Lite NPU</div>
+                                        <div style="font-size: 11px; margin-top: 4px;">RTSP stream is being processed by Motion Detection Engine</div>
                                     </div>
                                     <div style="position: absolute; bottom: 12px; left: 12px; font-size: 10px; color: #FF2A7A; font-weight: bold;">● REC</div>
                                     <div style="position: absolute; bottom: 12px; right: 12px; font-size: 10px; color: #8E8E9C;">5.0 FPS | 300x300</div>
                                 </div>
                             </div>
                         </div>
-
+ 
                         <div class="card">
                             <h2>SYSTEM DIAGNOSTICS</h2>
                             <div class="diagnostic-grid">
                                 <div>
-                                    <div class="metric-val">24ms</div>
-                                    <div class="metric-lbl">Inference Latency</div>
+                                    <div class="metric-val">1ms</div>
+                                    <div class="metric-lbl">Analysis Latency</div>
                                 </div>
                                 <div>
                                     <div class="metric-val">5.0 FPS</div>
                                     <div class="metric-lbl">Processing Speed</div>
                                 </div>
                                 <div>
-                                    <div class="metric-val">NPU / GPU</div>
-                                    <div class="metric-lbl">Hardware Engine</div>
+                                    <div class="metric-val">CPU</div>
+                                    <div class="metric-lbl">Detection Engine</div>
                                 </div>
                             </div>
                         </div>

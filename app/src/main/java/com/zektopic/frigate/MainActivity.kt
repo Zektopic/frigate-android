@@ -164,27 +164,38 @@ class MainActivity : ComponentActivity() {
             nvrDao.insertCameraConfig(camera)
         }
 
-        // Seed some mock historical events
+        // Seed some mock historical events with real demo video urls for playback testing
+        val videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
         val event1 = EventEntity(
             cameraId = "front_camera",
-            label = "person",
-            confidence = 0.94f,
+            label = "motion",
+            confidence = 1.00f,
             timestamp = System.currentTimeMillis() - 50000,
             snapshotPath = null,
-            videoPath = null,
+            videoPath = videoUrl,
             zone = "Driveway Zone"
         )
         val event2 = EventEntity(
             cameraId = "back_garden",
-            label = "car",
-            confidence = 0.81f,
+            label = "motion",
+            confidence = 1.00f,
             timestamp = System.currentTimeMillis() - 120000,
             snapshotPath = null,
-            videoPath = null,
+            videoPath = videoUrl,
             zone = "Garden Entry"
+        )
+        val event3 = EventEntity(
+            cameraId = "front_camera",
+            label = "motion",
+            confidence = 1.00f,
+            timestamp = System.currentTimeMillis() - 86400000 - 3600000, // yesterday, 1 hour ago
+            snapshotPath = null,
+            videoPath = videoUrl,
+            zone = "Driveway Zone"
         )
         nvrDao.insertEvent(event1)
         nvrDao.insertEvent(event2)
+        nvrDao.insertEvent(event3)
     }
 
     private fun triggerTestAlertNotification() {
