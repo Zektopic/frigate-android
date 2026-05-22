@@ -15,9 +15,6 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.zektopic.frigate.data.CameraConfigEntity
-import org.videolan.libvlc.LibVLC
-import org.videolan.libvlc.Media
-import org.videolan.libvlc.MediaPlayer
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
@@ -35,9 +32,7 @@ class StreamIngester(
     private var cameraExecutor: ExecutorService? = null
     private var cameraProvider: ProcessCameraProvider? = null
 
-    // LibVLC properties for external RTSP streams
-    private var libVlc: LibVLC? = null
-    private var mediaPlayer: MediaPlayer? = null
+    // RTSP properties
     private var rtspSimulationExecutor: java.util.concurrent.ScheduledExecutorService? = null
 
     fun start() {
@@ -69,12 +64,7 @@ class StreamIngester(
         }
         cameraProvider = null
 
-        // Stop LibVLC
-        mediaPlayer?.stop()
-        mediaPlayer?.release()
-        mediaPlayer = null
-        libVlc?.release()
-        libVlc = null
+
 
         // Stop RTSP Simulation
         rtspSimulationExecutor?.shutdown()
@@ -141,53 +131,24 @@ class StreamIngester(
     }
 
     private fun startRtspIngestion() {
-        try {
-            // Configure LibVLC arguments for ultra low-latency and performance
-            val options = ArrayList<String>()
-            options.add("--rtsp-tcp") // Force TCP stream to avoid UDP packet loss
-            options.add("--clock-jitter=0")
-            options.add("--network-caching=150") // 150ms buffer
-            options.add("--avcodec-hw=any") // Enable hardware accelerated decoding
-            options.add("-vvv") // Debug logging
-
-            libVlc = LibVLC(context, options)
-            mediaPlayer = MediaPlayer(libVlc)
-
-            // Setup Media playing parameters
-            val media = Media(libVlc, android.net.Uri.parse(config.rtspUrl))
-            media.addOption(":network-caching=150")
-            media.addOption(":clock-jitter=0")
-            media.addOption(":clock-synchro=0")
-            media.addOption(":rtsp-tcp")
-
-            mediaPlayer?.media = media
-            media.release()
-
-            // Since VLC callback rendering is not directly exposed in this API, 
-            // we simulate video frame extraction using a periodic background thread.
-            rtspSimulationExecutor = Executors.newSingleThreadScheduledExecutor()
-            val intervalMs = 1000L / config.fps
-            rtspSimulationExecutor?.scheduleAtFixedRate({
-                if (isIngesting) {
-                    val bitmap = Bitmap.createBitmap(config.detectWidth, config.detectHeight, Bitmap.Config.ARGB_8888)
-                    val canvas = android.graphics.Canvas(bitmap)
-                    canvas.drawColor(android.graphics.Color.DKGRAY)
-                    val paint = android.graphics.Paint().apply {
-                        color = android.graphics.Color.WHITE
-                        textSize = 20f
-                        isAntiAlias = true
-                    }
-                    canvas.drawText("${config.name} RTSP Stream", 20f, 40f, paint)
-                    canvas.drawText("Time: ${System.currentTimeMillis()}", 20f, 70f, paint)
-                    onFrameExtracted(bitmap)
+        Log.d(tag, "RTSP Client starting simulation for stream: ${config.rtspUrl}")
+        rtspSimulationExecutor = Executors.newSingleThreadScheduledExecutor()
+        val intervalMs = 1000L / config.fps
+        rtspSimulationExecutor?.scheduleAtFixedRate({
+            if (isIngesting) {
+                val bitmap = Bitmap.createBitmap(config.detectWidth, config.detectHeight, Bitmap.Config.ARGB_8888)
+                val canvas = android.graphics.Canvas(bitmap)
+                canvas.drawColor(android.graphics.Color.DKGRAY)
+                val paint = android.graphics.Paint().apply {
+                    color = android.graphics.Color.WHITE
+                    textSize = 20f
+                    isAntiAlias = true
                 }
-            }, 0, intervalMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-
-            mediaPlayer?.play()
-            Log.d(tag, "RTSP Client playing stream: ${config.rtspUrl}")
-        } catch (e: Exception) {
-            Log.e(tag, "Failed to initialize LibVLC RTSP ingestion", e)
-        }
+                canvas.drawText("${config.name} RTSP Stream", 20f, 40f, paint)
+                canvas.drawText("Time: ${System.currentTimeMillis()}", 20f, 70f, paint)
+                onFrameExtracted(bitmap)
+            }
+        }, 0, intervalMs, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
     // Helper extension function to convert CameraX YUV_420_888 ImageProxy to Bitmap

@@ -31,6 +31,14 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Request notification permission for alerts on Android 13+
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            val permissionState = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+            if (permissionState != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
+            }
+        }
+
         setContent {
             FrigateAndroidTheme {
                 val cameraConfigs by nvrDao.getAllCameraConfigsFlow().collectAsState(initial = emptyList())
@@ -43,6 +51,15 @@ class MainActivity : ComponentActivity() {
                     while (true) {
                         isServiceRunning = isServiceRunning(NvrService::class.java)
                         kotlinx.coroutines.delay(1000)
+                    }
+                }
+
+                // Auto-seed database with mock cameras and events if empty
+                LaunchedEffect(cameraConfigs) {
+                    if (cameraConfigs.isEmpty()) {
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            seedMockCameras()
+                        }
                     }
                 }
 

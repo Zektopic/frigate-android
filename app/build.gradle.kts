@@ -79,9 +79,6 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraVersion")
     implementation("androidx.camera:camera-view:$cameraVersion")
 
-    // LibVLC for Android RTSP streams
-    implementation("org.videolan.android:libvlc-all:3.6.0")
-
 
     // Room Database for local Events log & Settings
     val roomVersion = "2.6.1"
