@@ -17,7 +17,10 @@ import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
 import com.zektopic.frigate.media.StreamIngester
 import dagger.hilt.android.AndroidEntryPoint
+import android.graphics.Bitmap
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -33,6 +36,19 @@ class NvrService : Service(), LifecycleOwner {
     // Motion variables
     private val motionDetectors = mutableMapOf<String, com.zektopic.frigate.ai.MotionDetector>()
     private val lastEventTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // Live Frame flow and cache
+    private val latestFramesMap = java.util.concurrent.ConcurrentHashMap<String, Bitmap>()
+    private val _frameFlow = MutableSharedFlow<Pair<String, Bitmap>>(
+        replay = 0,
+        extraBufferCapacity = 1,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+    )
+    val frameFlow = _frameFlow.asSharedFlow()
+
+    fun getLatestFrame(cameraId: String): Bitmap? {
+        return latestFramesMap[cameraId]
+    }
 
     // Embedded Ktor Web Server
     private var webServer: com.zektopic.frigate.server.EmbeddedWebServer? = null
@@ -55,7 +71,16 @@ class NvrService : Service(), LifecycleOwner {
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
         
         // Show persistent status notification to run in background
-        startForeground(1, createStatusNotification("Initializing NVR streams..."))
+        val hasCameraPermission = checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            var type = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            if (hasCameraPermission) {
+                type = type or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
+            startForeground(1, createStatusNotification("Initializing NVR streams..."), type)
+        } else {
+            startForeground(1, createStatusNotification("Initializing NVR streams..."))
+        }
 
         // Observe database configurations flow and launch/reload streams dynamically
         serviceScope.launch {
@@ -110,6 +135,7 @@ class NvrService : Service(), LifecycleOwner {
         // Release resources
         motionDetectors.clear()
         lastEventTime.clear()
+        latestFramesMap.clear()
 
         // Stop web server
         webServer?.stop()
@@ -134,6 +160,10 @@ class NvrService : Service(), LifecycleOwner {
                 motionDetectors[camera.id] = com.zektopic.frigate.ai.MotionDetector(camera.motionThreshold)
 
                 val ingester = StreamIngester(this, camera) { frameBitmap ->
+                    // Cache frame and emit for Compose/Ktor clients
+                    latestFramesMap[camera.id] = frameBitmap
+                    _frameFlow.tryEmit(Pair(camera.id, frameBitmap))
+
                     // Route frame through the gated AI pipeline in a background thread
                     serviceScope.launch(Dispatchers.Default) {
                         processIncomingFrame(camera.id, frameBitmap)

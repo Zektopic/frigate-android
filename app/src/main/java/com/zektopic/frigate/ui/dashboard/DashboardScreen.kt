@@ -3,6 +3,8 @@ package com.zektopic.frigate.ui.dashboard
 import android.widget.Toast
 import android.widget.VideoView
 import android.widget.MediaController
+import android.graphics.Bitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.animation.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -48,6 +50,7 @@ fun DashboardScreen(
     cameraConfigs: List<CameraConfigEntity>,
     events: List<EventEntity>,
     systemConfig: com.zektopic.frigate.data.SystemConfigEntity?,
+    latestFrames: Map<String, Bitmap>,
     onSaveConfig: suspend (String) -> Unit,
     onAddMockCamera: () -> Unit,
     onTriggerTestNotification: () -> Unit,
@@ -86,6 +89,7 @@ fun DashboardScreen(
         when (tabIndex) {
             0 -> LiveDashboardScreen(
                 cameraConfigs = cameraConfigs,
+                latestFrames = latestFrames,
                 isServiceRunning = isServiceRunning,
                 onStart = onStartNvrService,
                 onStop = onStopNvrService,
@@ -96,6 +100,7 @@ fun DashboardScreen(
             )
             1 -> BirdseyeScreen(
                 cameraConfigs = cameraConfigs,
+                latestFrames = latestFrames,
                 isServiceRunning = isServiceRunning
             )
             2 -> RecordingsScreen(
@@ -281,6 +286,7 @@ fun DashboardScreen(
 @Composable
 fun LiveDashboardScreen(
     cameraConfigs: List<CameraConfigEntity>,
+    latestFrames: Map<String, Bitmap>,
     isServiceRunning: Boolean,
     onStart: () -> Unit,
     onStop: () -> Unit,
@@ -310,7 +316,11 @@ fun LiveDashboardScreen(
                 modifier = Modifier.fillMaxSize()
             ) {
                 items(cameraConfigs) { camera ->
-                    CameraLiveFeedCard(camera = camera, isServiceRunning = isServiceRunning)
+                    CameraLiveFeedCard(
+                        camera = camera,
+                        latestFrame = latestFrames[camera.id],
+                        isServiceRunning = isServiceRunning
+                    )
                 }
             }
         }
@@ -457,7 +467,7 @@ fun EmptyCamerasView(onAddMockCamera: () -> Unit) {
 }
 
 @Composable
-fun CameraLiveFeedCard(camera: CameraConfigEntity, isServiceRunning: Boolean) {
+fun CameraLiveFeedCard(camera: CameraConfigEntity, latestFrame: Bitmap?, isServiceRunning: Boolean) {
     var detectedObject by remember { mutableStateOf<String?>(null) }
     var motionPercentage by remember { mutableDoubleStateOf(0.0) }
 
@@ -566,23 +576,31 @@ fun CameraLiveFeedCard(camera: CameraConfigEntity, isServiceRunning: Boolean) {
                     ),
                 contentAlignment = Alignment.Center
             ) {
-                // Background scanline/mesh effects to mimic terminal monitor
-                Column(
-                    modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = Arrangement.SpaceBetween
-                ) {
-                    repeat(9) {
-                        Divider(color = Color.White.copy(alpha = 0.015f), thickness = 1.dp)
-                    }
-                }
-
                 if (isServiceRunning) {
-                    Icon(
-                        imageVector = Icons.Default.FilterCenterFocus,
-                        contentDescription = "Focus Area",
-                        tint = if (detectedObject != null && isDetectEnabled) HotPink.copy(alpha = 0.6f) else CyberCyan.copy(alpha = 0.3f),
-                        modifier = Modifier.size(48.dp)
-                    )
+                    if (latestFrame != null) {
+                        androidx.compose.foundation.Image(
+                            bitmap = latestFrame.asImageBitmap(),
+                            contentDescription = "Live Feed",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                        )
+                    } else {
+                        // Background scanline/mesh effects to mimic terminal monitor
+                        Column(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            repeat(9) {
+                                Divider(color = Color.White.copy(alpha = 0.015f), thickness = 1.dp)
+                            }
+                        }
+                        Icon(
+                            imageVector = Icons.Default.FilterCenterFocus,
+                            contentDescription = "Focus Area",
+                            tint = if (detectedObject != null && isDetectEnabled) HotPink.copy(alpha = 0.6f) else CyberCyan.copy(alpha = 0.3f),
+                            modifier = Modifier.size(48.dp)
+                        )
+                    }
 
                     // Draw motion alert reticle boundary box
                     if (detectedObject != null && isDetectEnabled) {
@@ -691,7 +709,11 @@ fun ToggleButton(label: String, active: Boolean, onToggle: () -> Unit, activeCol
 // Birdseye Tab
 // -------------------------------------------------------------
 @Composable
-fun BirdseyeScreen(cameraConfigs: List<CameraConfigEntity>, isServiceRunning: Boolean) {
+fun BirdseyeScreen(
+    cameraConfigs: List<CameraConfigEntity>,
+    latestFrames: Map<String, Bitmap>,
+    isServiceRunning: Boolean
+) {
     val motionStates = remember { mutableStateMapOf<String, Double>() }
 
     LaunchedEffect(isServiceRunning) {
@@ -788,7 +810,11 @@ fun BirdseyeScreen(cameraConfigs: List<CameraConfigEntity>, isServiceRunning: Bo
                 modifier = Modifier.fillMaxSize()
             ) {
                 items(camerasWithMotion) { camera ->
-                    BirdseyeCameraCard(camera = camera, motionVal = motionStates[camera.id] ?: 0.0)
+                    BirdseyeCameraCard(
+                        camera = camera,
+                        latestFrame = latestFrames[camera.id],
+                        motionVal = motionStates[camera.id] ?: 0.0
+                    )
                 }
             }
         }
@@ -796,7 +822,7 @@ fun BirdseyeScreen(cameraConfigs: List<CameraConfigEntity>, isServiceRunning: Bo
 }
 
 @Composable
-fun BirdseyeCameraCard(camera: CameraConfigEntity, motionVal: Double) {
+fun BirdseyeCameraCard(camera: CameraConfigEntity, latestFrame: Bitmap?, motionVal: Double) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -840,12 +866,21 @@ fun BirdseyeCameraCard(camera: CameraConfigEntity, motionVal: Double) {
                     .background(Color(0xFF09090D)),
                 contentAlignment = Alignment.Center
             ) {
-                Column(
-                    modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = Arrangement.SpaceBetween
-                ) {
-                    repeat(8) {
-                        Divider(color = Color.White.copy(alpha = 0.01f), thickness = 1.dp)
+                if (latestFrame != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = latestFrame.asImageBitmap(),
+                        contentDescription = "Birdseye Feed",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                    )
+                } else {
+                    Column(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        repeat(8) {
+                            Divider(color = Color.White.copy(alpha = 0.01f), thickness = 1.dp)
+                        }
                     }
                 }
 
@@ -854,6 +889,7 @@ fun BirdseyeCameraCard(camera: CameraConfigEntity, motionVal: Double) {
                         .size(width = 110.dp, height = 80.dp)
                         .border(2.dp, ElectricEmerald, RoundedCornerShape(4.dp))
                         .background(ElectricEmerald.copy(alpha = 0.05f))
+                        .align(Alignment.Center)
                 ) {
                     Text(
                         text = "TRACKING",
@@ -863,6 +899,7 @@ fun BirdseyeCameraCard(camera: CameraConfigEntity, motionVal: Double) {
                         modifier = Modifier
                             .background(ElectricEmerald)
                             .padding(horizontal = 4.dp, vertical = 1.dp)
+                            .align(Alignment.TopStart)
                     )
                 }
 
@@ -1030,6 +1067,7 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                     factory = { context ->
                         VideoView(context).apply {
                             setVideoPath(videoUrl)
+                            tag = videoUrl
                             val mediaController = MediaController(context)
                             mediaController.setAnchorView(this)
                             setMediaController(mediaController)
@@ -1040,8 +1078,11 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                         }
                     },
                     update = { view ->
-                        // Standard update lifecycle to reload URL if it changes
-                        view.setVideoPath(videoUrl)
+                        // Guard to avoid resetting same path during recomposition
+                        if (view.tag != videoUrl) {
+                            view.setVideoPath(videoUrl)
+                            view.tag = videoUrl
+                        }
                     },
                     modifier = Modifier.fillMaxSize()
                 )

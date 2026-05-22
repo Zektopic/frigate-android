@@ -72,6 +72,10 @@ class StreamIngester(
     }
 
     private fun startLocalCameraIngestion() {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            Log.e(tag, "Cannot start local camera ingestion: CAMERA permission not granted.")
+            return
+        }
         cameraExecutor = Executors.newSingleThreadExecutor()
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
 

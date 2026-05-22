@@ -21,6 +21,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import javax.inject.Inject
+import android.content.ServiceConnection
+import android.content.ComponentName
+import android.os.IBinder
+import android.graphics.Bitmap
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
@@ -28,15 +32,51 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var nvrDao: NvrDao
 
+    private var nvrService by mutableStateOf<NvrService?>(null)
+    private var isBound by mutableStateOf(false)
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(className: ComponentName, service: IBinder) {
+            val binder = service as NvrService.NvrBinder
+            nvrService = binder.getService()
+            isBound = true
+        }
+
+        override fun onServiceDisconnected(arg0: ComponentName) {
+            nvrService = null
+            isBound = false
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val intent = Intent(this, NvrService::class.java)
+        bindService(intent, connection, Context.BIND_AUTO_CREATE)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (isBound) {
+            unbindService(connection)
+            isBound = false
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Request notification permission for alerts on Android 13+
+        // Request required permissions for notifications and camera access
+        val requiredPermissions = mutableListOf<String>()
         if (android.os.Build.VERSION.SDK_INT >= 33) {
-            val permissionState = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-            if (permissionState != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(android.Manifest.permission.POST_NOTIFICATIONS)
             }
+        }
+        if (checkSelfPermission(android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requiredPermissions.add(android.Manifest.permission.CAMERA)
+        }
+        if (requiredPermissions.isNotEmpty()) {
+            requestPermissions(requiredPermissions.toTypedArray(), 101)
         }
 
         setContent {
@@ -45,13 +85,24 @@ class MainActivity : ComponentActivity() {
                 val events by nvrDao.getAllEventsFlow().collectAsState(initial = emptyList())
                 val systemConfig by nvrDao.getSystemConfigFlow().collectAsState(initial = null)
                 var isServiceRunning by remember { mutableStateOf(false) }
+                val latestFrames = remember { mutableStateMapOf<String, Bitmap>() }
 
-                // Periodically check if background service is running
+                // Periodically check if background service is running and auto-start it
                 LaunchedEffect(Unit) {
+                    startNvrService()
                     while (true) {
                         isServiceRunning = isServiceRunning(NvrService::class.java)
                         kotlinx.coroutines.delay(1000)
                     }
+                }
+
+                // Collect frames from active bound service
+                LaunchedEffect(nvrService) {
+                    nvrService?.let { service ->
+                        service.frameFlow.collect { (cameraId, bitmap) ->
+                            latestFrames[cameraId] = bitmap
+                        }
+                    } ?: latestFrames.clear()
                 }
 
                 // Auto-seed database with mock cameras and events if empty
@@ -67,6 +118,7 @@ class MainActivity : ComponentActivity() {
                     cameraConfigs = cameraConfigs,
                     events = events,
                     systemConfig = systemConfig,
+                    latestFrames = latestFrames,
                     onSaveConfig = { yamlText ->
                         val parsedCameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlText)
                         nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlText))
@@ -253,6 +305,19 @@ class MainActivity : ComponentActivity() {
             }
         } catch (e: SecurityException) {
             e.printStackTrace()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 101) {
+            // Restart NVR service to pick up newly granted camera/notification permissions
+            startNvrService()
         }
     }
 }

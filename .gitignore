@@ -23,3 +23,6 @@ Thumbs.db
 
 # Log files
 *.log
+
+# Local test binary dumps
+*.bin

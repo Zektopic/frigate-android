@@ -5,7 +5,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 
-@Database(entities = [CameraConfigEntity::class, EventEntity::class, SystemConfigEntity::class], version = 1, exportSchema = false)
+@Database(entities = [CameraConfigEntity::class, EventEntity::class, SystemConfigEntity::class], version = 2, exportSchema = false)
 abstract class NvrDatabase : RoomDatabase() {
 
     abstract fun nvrDao(): NvrDao
