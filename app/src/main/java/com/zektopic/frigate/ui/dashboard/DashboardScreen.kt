@@ -83,7 +83,10 @@ fun DashboardScreen(
     }
 
     val configuration = LocalConfiguration.current
-    val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    val screenWidthDp = configuration.screenWidthDp
+
+    val isMedium = screenWidthDp in 600..839
+    val isExpanded = screenWidthDp >= 840
 
     // Screen content router
     @Composable
@@ -98,7 +101,8 @@ fun DashboardScreen(
                 onAddMockCamera = onAddMockCamera,
                 currentFps = currentFps,
                 currentCpu = currentCpuUsage,
-                currentInferenceTime = currentInferenceTime
+                currentInferenceTime = currentInferenceTime,
+                screenWidthDp = screenWidthDp
             )
             1 -> BirdseyeScreen(
                 cameraConfigs = cameraConfigs,
@@ -106,22 +110,141 @@ fun DashboardScreen(
                 isServiceRunning = isServiceRunning
             )
             2 -> RecordingsScreen(
-                events = events
+                events = events,
+                screenWidthDp = screenWidthDp
             )
             3 -> SystemScreen(
                 cameraConfigs = cameraConfigs,
                 isServiceRunning = isServiceRunning,
-                cpu = currentCpuUsage
+                cpu = currentCpuUsage,
+                screenWidthDp = screenWidthDp
             )
             4 -> ConfigScreen(
                 systemConfig = systemConfig,
-                onSaveConfig = onSaveConfig
+                onSaveConfig = onSaveConfig,
+                screenWidthDp = screenWidthDp
             )
         }
     }
 
-    if (isLandscape) {
-        // Landscape Orientation: Sidebar layout
+    val destinations = listOf("Live", "Birdseye", "Recordings", "System", "Config")
+    val icons = listOf(
+        Icons.Default.Videocam,
+        Icons.Default.Visibility,
+        Icons.Default.History,
+        Icons.Default.Info,
+        Icons.Default.Settings
+    )
+
+    if (isExpanded) {
+        // Expanded: permanent sidebar drawer
+        Row(modifier = Modifier.fillMaxSize().background(DarkVoid)) {
+            Column(
+                modifier = Modifier
+                    .width(240.dp)
+                    .fillMaxHeight()
+                    .background(DeepCharcoal)
+                    .drawBehind {
+                        val strokeWidth = 1.dp.toPx()
+                        drawLine(
+                            color = SlateBorder,
+                            start = Offset(size.width - strokeWidth / 2, 0f),
+                            end = Offset(size.width - strokeWidth / 2, size.height),
+                            strokeWidth = strokeWidth
+                        )
+                    }
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.padding(bottom = 24.dp, start = 4.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Security,
+                        contentDescription = "Frigate Logo",
+                        tint = CyberCyan,
+                        modifier = Modifier.size(32.dp)
+                    )
+                    Text(
+                        text = "FRIGATE NVR",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 1.5.sp
+                        ),
+                        color = LightWhite
+                    )
+                }
+
+                destinations.forEachIndexed { index, title ->
+                    val selected = selectedTab == index
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (selected) CyberCyan.copy(alpha = 0.15f) else Color.Transparent)
+                            .clickable { selectedTab = index }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = icons[index],
+                            contentDescription = title,
+                            tint = if (selected) CyberCyan else SoftGray,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Text(
+                            text = title,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                            fontSize = 13.sp,
+                            color = if (selected) LightWhite else SoftGray
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.weight(1f))
+
+                Divider(color = SlateBorder)
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { onTriggerTestNotification() }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.NotificationsActive,
+                        contentDescription = "Test Notification",
+                        tint = CyberCyan,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = "Notifications",
+                        fontSize = 12.sp,
+                        color = SoftGray
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .padding(16.dp)
+            ) {
+                TargetScreenContent(selectedTab)
+            }
+        }
+    } else if (isMedium) {
+        // Medium: NavigationRail sidebar
         Row(modifier = Modifier.fillMaxSize().background(DarkVoid)) {
             NavigationRail(
                 containerColor = DeepCharcoal,
@@ -144,15 +267,6 @@ fun DashboardScreen(
                     modifier = Modifier.size(28.dp)
                 )
                 Spacer(modifier = Modifier.weight(1f))
-
-                val destinations = listOf("Live", "Birdseye", "Recordings", "System", "Config")
-                val icons = listOf(
-                    Icons.Default.Videocam,
-                    Icons.Default.Visibility,
-                    Icons.Default.History,
-                    Icons.Default.Info,
-                    Icons.Default.Settings
-                )
 
                 destinations.forEachIndexed { index, title ->
                     NavigationRailItem(
@@ -191,7 +305,7 @@ fun DashboardScreen(
             }
         }
     } else {
-        // Portrait Orientation: Bottom Navigation layout
+        // Compact: Bottom Navigation layout
         Scaffold(
             topBar = {
                 CenterAlignedTopAppBar(
@@ -242,15 +356,6 @@ fun DashboardScreen(
                         )
                     }
                 ) {
-                    val destinations = listOf("Live", "Birdseye", "Recordings", "System", "Config")
-                    val icons = listOf(
-                        Icons.Default.Videocam,
-                        Icons.Default.Visibility,
-                        Icons.Default.History,
-                        Icons.Default.Info,
-                        Icons.Default.Settings
-                    )
-
                     destinations.forEachIndexed { index, title ->
                         NavigationBarItem(
                             selected = selectedTab == index,
@@ -295,8 +400,16 @@ fun LiveDashboardScreen(
     onAddMockCamera: () -> Unit,
     currentFps: Float,
     currentCpu: Int,
-    currentInferenceTime: Int
+    currentInferenceTime: Int,
+    screenWidthDp: Int
 ) {
+    val gridColumns = when {
+        screenWidthDp < 600 -> 1
+        screenWidthDp < 960 -> 2
+        screenWidthDp < 1440 -> 3
+        else -> 4
+    }
+
     Column(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -313,8 +426,10 @@ fun LiveDashboardScreen(
         if (cameraConfigs.isEmpty()) {
             EmptyCamerasView(onAddMockCamera)
         } else {
-            LazyColumn(
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(gridColumns),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
                 items(cameraConfigs) { camera ->
@@ -923,7 +1038,7 @@ fun BirdseyeCameraCard(camera: CameraConfigEntity, latestFrame: Bitmap?, motionV
 // Recordings Tab
 // -------------------------------------------------------------
 @Composable
-fun RecordingsScreen(events: List<EventEntity>) {
+fun RecordingsScreen(events: List<EventEntity>, screenWidthDp: Int) {
     var selectedCameraFilter by remember { mutableStateOf("ALL") }
     var activePlaybackEvent by remember { mutableStateOf<EventEntity?>(null) }
 
@@ -939,93 +1054,227 @@ fun RecordingsScreen(events: List<EventEntity>) {
         }
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        activePlaybackEvent?.let { event ->
-            if (!event.videoPath.isNullOrEmpty()) {
-                VideoPlayer(
-                    videoUrl = event.videoPath,
-                    onClose = { activePlaybackEvent = null }
-                )
-            } else {
+    val isWide = screenWidthDp >= 600
+
+    if (isWide) {
+        // Two-Pane Master-Detail layout
+        Row(modifier = Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            // Left Pane: Master list (filter + recordings)
+            Column(
+                modifier = Modifier.width(360.dp).fillMaxHeight(),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Card(
-                    modifier = Modifier.fillMaxWidth().border(1.dp, ErrorRed, RoundedCornerShape(12.dp)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, SlateBorder, RoundedCornerShape(12.dp)),
                     colors = CardDefaults.cardColors(containerColor = CardCarbon)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "RECORDED CLIPS",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = CyberCyan
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Filter:", fontSize = 11.sp, color = SoftGray)
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                items(cameraList) { cam ->
+                                    val selected = selectedCameraFilter == cam
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(if (selected) CyberCyan.copy(alpha = 0.15f) else CardCarbon)
+                                            .border(1.dp, if (selected) CyberCyan else SlateBorder, RoundedCornerShape(6.dp))
+                                            .clickable { selectedCameraFilter = cam }
+                                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                                    ) {
+                                        Text(
+                                            text = cam.uppercase(),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (selected) CyberCyan else SoftGray
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (filteredEvents.isEmpty()) {
+                    Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Text("No recordings logs found in database", color = SoftGray, fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.weight(1f).fillMaxWidth()
                     ) {
-                        Text("No video playback available for this motion event.", color = ErrorRed, fontSize = 12.sp)
-                        IconButton(onClick = { activePlaybackEvent = null }) {
-                            Icon(Icons.Default.Close, "Close", tint = SoftGray)
+                        items(filteredEvents) { event ->
+                            RecordingListItem(
+                                event = event,
+                                onPlayClick = { activePlaybackEvent = event }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Right Pane: Detail player or placeholder
+            Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                activePlaybackEvent?.let { event ->
+                    if (!event.videoPath.isNullOrEmpty()) {
+                        VideoPlayer(
+                            videoUrl = event.videoPath,
+                            onClose = { activePlaybackEvent = null }
+                        )
+                    } else {
+                        Card(
+                            modifier = Modifier.fillMaxWidth().border(1.dp, ErrorRed, RoundedCornerShape(12.dp)),
+                            colors = CardDefaults.cardColors(containerColor = CardCarbon)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("No video playback available for this motion event.", color = ErrorRed, fontSize = 12.sp)
+                                IconButton(onClick = { activePlaybackEvent = null }) {
+                                    Icon(Icons.Default.Close, "Close", tint = SoftGray)
+                                }
+                            }
+                        }
+                    }
+                } ?: run {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = CardCarbon)
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.PlayCircleOutline,
+                                contentDescription = "No Recording Selected",
+                                tint = CyberCyan.copy(alpha = 0.5f),
+                                modifier = Modifier.size(72.dp)
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = "Select a recording from the left list to begin playback",
+                                color = SoftGray,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 14.sp,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                modifier = Modifier.padding(horizontal = 32.dp)
+                            )
                         }
                     }
                 }
             }
         }
-
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .border(1.dp, SlateBorder, RoundedCornerShape(12.dp)),
-            colors = CardDefaults.cardColors(containerColor = CardCarbon)
+    } else {
+        // Compact: single-pane vertical stack
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    text = "RECORDED CLIPS",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    color = CyberCyan
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Filter:", fontSize = 11.sp, color = SoftGray)
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(cameraList) { cam ->
-                            val selected = selectedCameraFilter == cam
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(if (selected) CyberCyan.copy(alpha = 0.15f) else CardCarbon)
-                                    .border(1.dp, if (selected) CyberCyan else SlateBorder, RoundedCornerShape(6.dp))
-                                    .clickable { selectedCameraFilter = cam }
-                                    .padding(horizontal = 10.dp, vertical = 6.dp)
-                            ) {
-                                Text(
-                                    text = cam.uppercase(),
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (selected) CyberCyan else SoftGray
-                                )
+            activePlaybackEvent?.let { event ->
+                if (!event.videoPath.isNullOrEmpty()) {
+                    VideoPlayer(
+                        videoUrl = event.videoPath,
+                        onClose = { activePlaybackEvent = null }
+                    )
+                } else {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().border(1.dp, ErrorRed, RoundedCornerShape(12.dp)),
+                        colors = CardDefaults.cardColors(containerColor = CardCarbon)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("No video playback available for this motion event.", color = ErrorRed, fontSize = 12.sp)
+                            IconButton(onClick = { activePlaybackEvent = null }) {
+                                Icon(Icons.Default.Close, "Close", tint = SoftGray)
                             }
                         }
                     }
                 }
             }
-        }
 
-        if (filteredEvents.isEmpty()) {
-            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text("No recordings logs found in database", color = SoftGray, fontWeight = FontWeight.Bold)
-            }
-        } else {
-            LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.weight(1f).fillMaxWidth()
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, SlateBorder, RoundedCornerShape(12.dp)),
+                colors = CardDefaults.cardColors(containerColor = CardCarbon)
             ) {
-                items(filteredEvents) { event ->
-                    RecordingListItem(
-                        event = event,
-                        onPlayClick = { activePlaybackEvent = event }
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "RECORDED CLIPS",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = CyberCyan
                     )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Filter:", fontSize = 11.sp, color = SoftGray)
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(cameraList) { cam ->
+                                val selected = selectedCameraFilter == cam
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(if (selected) CyberCyan.copy(alpha = 0.15f) else CardCarbon)
+                                        .border(1.dp, if (selected) CyberCyan else SlateBorder, RoundedCornerShape(6.dp))
+                                        .clickable { selectedCameraFilter = cam }
+                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                ) {
+                                    Text(
+                                        text = cam.uppercase(),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (selected) CyberCyan else SoftGray
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (filteredEvents.isEmpty()) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Text("No recordings logs found in database", color = SoftGray, fontWeight = FontWeight.Bold)
+                }
+            } else {
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f).fillMaxWidth()
+                ) {
+                    items(filteredEvents) { event ->
+                        RecordingListItem(
+                            event = event,
+                            onPlayClick = { activePlaybackEvent = event }
+                        )
+                    }
                 }
             }
         }
@@ -1237,7 +1486,7 @@ fun RecordingListItem(event: EventEntity, onPlayClick: () -> Unit) {
 // System Tab
 // -------------------------------------------------------------
 @Composable
-fun SystemScreen(cameraConfigs: List<CameraConfigEntity>, isServiceRunning: Boolean, cpu: Int) {
+fun SystemScreen(cameraConfigs: List<CameraConfigEntity>, isServiceRunning: Boolean, cpu: Int, screenWidthDp: Int) {
     var cpuVal by remember { mutableFloatStateOf(0.0f) }
     var ramVal by remember { mutableFloatStateOf(0.0f) }
     var diskVal by remember { mutableFloatStateOf(0.48f) }
@@ -1257,106 +1506,218 @@ fun SystemScreen(cameraConfigs: List<CameraConfigEntity>, isServiceRunning: Bool
         }
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        // System Diagnostics Card with Canvas Gauges
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
-            colors = CardDefaults.cardColors(containerColor = CardCarbon)
-        ) {
-            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(
-                    text = "SYSTEM ENGINE DIAGNOSTICS",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    color = CyberCyan
-                )
+    val isExpanded = screenWidthDp >= 840
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    GaugeIndicator(label = "CPU LOAD", value = cpuVal, color = CyberCyan)
-                    GaugeIndicator(label = "RAM ENGINE", value = ramVal, color = ElectricEmerald)
-                    GaugeIndicator(label = "DISK SPACE", value = diskVal, color = WarningYellow)
+    if (isExpanded) {
+        // Side-by-side layout for expanded screens
+        Row(
+            modifier = Modifier.fillMaxSize(),
+            horizontalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // System Diagnostics Card
+            Card(
+                modifier = Modifier
+                    .weight(1.2f)
+                    .fillMaxHeight()
+                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
+                colors = CardDefaults.cardColors(containerColor = CardCarbon)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        text = "SYSTEM ENGINE DIAGNOSTICS",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = CyberCyan
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        GaugeIndicator(label = "CPU LOAD", value = cpuVal, color = CyberCyan)
+                        GaugeIndicator(label = "RAM ENGINE", value = ramVal, color = ElectricEmerald)
+                        GaugeIndicator(label = "DISK SPACE", value = diskVal, color = WarningYellow)
+                    }
+                }
+            }
+
+            // Camera performance stats table
+            Card(
+                modifier = Modifier
+                    .weight(1.8f)
+                    .fillMaxHeight()
+                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
+                colors = CardDefaults.cardColors(containerColor = CardCarbon)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "CAMERA STREAMING METRICS",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = CyberCyan
+                    )
+                    Divider(color = SlateBorder)
+
+                    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                        Text("Camera", modifier = Modifier.weight(1.4f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                        Text("Target", modifier = Modifier.weight(0.8f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                        Text("Actual", modifier = Modifier.weight(0.8f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                        Text("Bitrate", modifier = Modifier.weight(0.9f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                        Text("Resolution", modifier = Modifier.weight(1.1f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                    }
+
+                    if (cameraConfigs.isEmpty()) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("No cameras metrics available", color = SoftGray, fontSize = 12.sp)
+                        }
+                    } else {
+                        LazyColumn(modifier = Modifier.fillMaxSize()) {
+                            items(cameraConfigs) { camera ->
+                                var dynamicFps by remember { mutableFloatStateOf(camera.fps.toFloat()) }
+                                var dynamicBitrate by remember { mutableIntStateOf(1024) }
+
+                                LaunchedEffect(isServiceRunning) {
+                                    if (isServiceRunning) {
+                                        while (true) {
+                                            dynamicFps = (camera.fps + (Math.random() * 0.4f - 0.2f)).toFloat()
+                                            dynamicBitrate = (1200 + (Math.random() * 400 - 200)).toInt()
+                                            delay(2500)
+                                        }
+                                    } else {
+                                        dynamicFps = 0.0f
+                                        dynamicBitrate = 0
+                                    }
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(camera.name, modifier = Modifier.weight(1.4f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = LightWhite)
+                                    Text("${camera.fps} FPS", modifier = Modifier.weight(0.8f), fontSize = 11.sp, color = LightWhite)
+                                    Text(
+                                        text = if (isServiceRunning) String.format("%.1f", dynamicFps) + " FPS" else "0.0 FPS",
+                                        modifier = Modifier.weight(0.8f),
+                                        fontSize = 11.sp,
+                                        color = ElectricEmerald
+                                    )
+                                    Text(
+                                        text = if (isServiceRunning) "${dynamicBitrate}Kbps" else "0Kbps",
+                                        modifier = Modifier.weight(0.9f),
+                                        fontSize = 11.sp,
+                                        color = CyberCyan
+                                    )
+                                    Text("${camera.detectWidth}x${camera.detectHeight}", modifier = Modifier.weight(1.1f), fontSize = 11.sp, color = LightWhite)
+                                }
+                                Divider(color = SlateBorder.copy(alpha = 0.5f))
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        // Camera performance stats table
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
-            colors = CardDefaults.cardColors(containerColor = CardCarbon)
+    } else {
+        // Stacked column layout for compact/medium screens
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    text = "CAMERA STREAMING METRICS",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    color = CyberCyan
-                )
-                Divider(color = SlateBorder)
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
+                colors = CardDefaults.cardColors(containerColor = CardCarbon)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        text = "SYSTEM ENGINE DIAGNOSTICS",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = CyberCyan
+                    )
 
-                Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                    Text("Camera", modifier = Modifier.weight(1.4f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
-                    Text("Target", modifier = Modifier.weight(0.8f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
-                    Text("Actual", modifier = Modifier.weight(0.8f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
-                    Text("Bitrate", modifier = Modifier.weight(0.9f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
-                    Text("Resolution", modifier = Modifier.weight(1.1f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
-                }
-
-                if (cameraConfigs.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("No cameras metrics available", color = SoftGray, fontSize = 12.sp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        GaugeIndicator(label = "CPU LOAD", value = cpuVal, color = CyberCyan)
+                        GaugeIndicator(label = "RAM ENGINE", value = ramVal, color = ElectricEmerald)
+                        GaugeIndicator(label = "DISK SPACE", value = diskVal, color = WarningYellow)
                     }
-                } else {
-                    LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(cameraConfigs) { camera ->
-                            var dynamicFps by remember { mutableFloatStateOf(camera.fps.toFloat()) }
-                            var dynamicBitrate by remember { mutableIntStateOf(1024) }
+                }
+            }
 
-                            LaunchedEffect(isServiceRunning) {
-                                if (isServiceRunning) {
-                                    while (true) {
-                                        dynamicFps = (camera.fps + (Math.random() * 0.4f - 0.2f)).toFloat()
-                                        dynamicBitrate = (1200 + (Math.random() * 400 - 200)).toInt()
-                                        delay(2500)
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
+                colors = CardDefaults.cardColors(containerColor = CardCarbon)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "CAMERA STREAMING METRICS",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = CyberCyan
+                    )
+                    Divider(color = SlateBorder)
+
+                    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                        Text("Camera", modifier = Modifier.weight(1.4f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                        Text("Target", modifier = Modifier.weight(0.8f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                        Text("Actual", modifier = Modifier.weight(0.8f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                        Text("Bitrate", modifier = Modifier.weight(0.9f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                        Text("Resolution", modifier = Modifier.weight(1.1f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SoftGray)
+                    }
+
+                    if (cameraConfigs.isEmpty()) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("No cameras metrics available", color = SoftGray, fontSize = 12.sp)
+                        }
+                    } else {
+                        LazyColumn(modifier = Modifier.fillMaxSize()) {
+                            items(cameraConfigs) { camera ->
+                                var dynamicFps by remember { mutableFloatStateOf(camera.fps.toFloat()) }
+                                var dynamicBitrate by remember { mutableIntStateOf(1024) }
+
+                                LaunchedEffect(isServiceRunning) {
+                                    if (isServiceRunning) {
+                                        while (true) {
+                                            dynamicFps = (camera.fps + (Math.random() * 0.4f - 0.2f)).toFloat()
+                                            dynamicBitrate = (1200 + (Math.random() * 400 - 200)).toInt()
+                                            delay(2500)
+                                        }
+                                    } else {
+                                        dynamicFps = 0.0f
+                                        dynamicBitrate = 0
                                     }
-                                } else {
-                                    dynamicFps = 0.0f
-                                    dynamicBitrate = 0
                                 }
-                            }
 
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(camera.name, modifier = Modifier.weight(1.4f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = LightWhite)
-                                Text("${camera.fps} FPS", modifier = Modifier.weight(0.8f), fontSize = 11.sp, color = LightWhite)
-                                Text(
-                                    text = if (isServiceRunning) String.format("%.1f", dynamicFps) + " FPS" else "0.0 FPS",
-                                    modifier = Modifier.weight(0.8f),
-                                    fontSize = 11.sp,
-                                    color = ElectricEmerald
-                                )
-                                Text(
-                                    text = if (isServiceRunning) "${dynamicBitrate}Kbps" else "0Kbps",
-                                    modifier = Modifier.weight(0.9f),
-                                    fontSize = 11.sp,
-                                    color = CyberCyan
-                                )
-                                Text("${camera.detectWidth}x${camera.detectHeight}", modifier = Modifier.weight(1.1f), fontSize = 11.sp, color = LightWhite)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(camera.name, modifier = Modifier.weight(1.4f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = LightWhite)
+                                    Text("${camera.fps} FPS", modifier = Modifier.weight(0.8f), fontSize = 11.sp, color = LightWhite)
+                                    Text(
+                                        text = if (isServiceRunning) String.format("%.1f", dynamicFps) + " FPS" else "0.0 FPS",
+                                        modifier = Modifier.weight(0.8f),
+                                        fontSize = 11.sp,
+                                        color = ElectricEmerald
+                                    )
+                                    Text(
+                                        text = if (isServiceRunning) "${dynamicBitrate}Kbps" else "0Kbps",
+                                        modifier = Modifier.weight(0.9f),
+                                        fontSize = 11.sp,
+                                        color = CyberCyan
+                                    )
+                                    Text("${camera.detectWidth}x${camera.detectHeight}", modifier = Modifier.weight(1.1f), fontSize = 11.sp, color = LightWhite)
+                                }
+                                Divider(color = SlateBorder.copy(alpha = 0.5f))
                             }
-                            Divider(color = SlateBorder.copy(alpha = 0.5f))
                         }
                     }
                 }
@@ -1417,7 +1778,8 @@ fun GaugeIndicator(label: String, value: Float, color: Color) {
 @Composable
 fun ConfigScreen(
     systemConfig: com.zektopic.frigate.data.SystemConfigEntity?,
-    onSaveConfig: suspend (String) -> Unit
+    onSaveConfig: suspend (String) -> Unit,
+    screenWidthDp: Int
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -1425,11 +1787,17 @@ fun ConfigScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isSaving by remember { mutableStateOf(false) }
 
-    Column(
+    val isExpanded = screenWidthDp >= 840
+
+    Box(
         modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        contentAlignment = Alignment.TopCenter
     ) {
-        errorMessage?.let { error ->
+        Column(
+            modifier = if (isExpanded) Modifier.widthIn(max = 1200.dp) else Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            errorMessage?.let { error ->
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1595,5 +1963,6 @@ fun ConfigScreen(
                 }
             }
         }
+    }
     }
 }
