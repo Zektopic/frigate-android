@@ -54,6 +54,9 @@ android {
             useLegacyPackaging = false
         }
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -79,6 +82,10 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraVersion")
     implementation("androidx.camera:camera-view:$cameraVersion")
 
+    // Jetpack Media3 ExoPlayer for robust RTSP decoding
+    val media3Version = "1.3.1"
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-exoplayer-rtsp:$media3Version")
 
     // Room Database for local Events log & Settings
     val roomVersion = "2.6.1"

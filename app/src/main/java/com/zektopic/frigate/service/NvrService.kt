@@ -21,6 +21,7 @@ import android.graphics.Bitmap
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.debounce
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -85,7 +86,8 @@ class NvrService : Service(), LifecycleOwner {
         // Observe database configurations flow and launch/reload streams dynamically
         serviceScope.launch {
             try {
-                nvrDao.getAllCameraConfigsFlow().collect { cameras ->
+                @OptIn(kotlinx.coroutines.FlowPreview::class)
+                nvrDao.getAllCameraConfigsFlow().debounce(500L).collect { cameras ->
                     val activeCameras = cameras.filter { it.isEnabled }
                     withContext(Dispatchers.Main) {
                         if (activeCameras.isEmpty()) {
@@ -145,7 +147,22 @@ class NvrService : Service(), LifecycleOwner {
         super.onDestroy()
     }
 
+    // Track the last camera config set to avoid unnecessary restarts
+    private var lastCameraConfigSnapshot: List<CameraConfigEntity> = emptyList()
+
     private fun startActiveStreams(cameras: List<CameraConfigEntity>) {
+        // Compare new config with existing - only restart if something actually changed
+        val newConfigSignatures = cameras.map { configSignature(it) }.toSet()
+        val oldConfigSignatures = lastCameraConfigSnapshot.map { configSignature(it) }.toSet()
+
+        if (newConfigSignatures == oldConfigSignatures && activeIngesters.size == cameras.size) {
+            Log.d(tag, "Camera configs unchanged, skipping stream restart.")
+            return
+        }
+
+        Log.i(tag, "Camera configs changed. Restarting ${cameras.size} stream(s)...")
+        lastCameraConfigSnapshot = cameras.toList()
+
         synchronized(activeIngesters) {
             // Stop any existing streams first
             for (ingester in activeIngesters.values) {
@@ -173,6 +190,10 @@ class NvrService : Service(), LifecycleOwner {
                 ingester.start()
             }
         }
+    }
+
+    private fun configSignature(c: CameraConfigEntity): String {
+        return "${c.id}|${c.name}|${c.rtspUrl}|${c.isEnabled}|${c.detectWidth}|${c.detectHeight}|${c.fps}|${c.motionThreshold}"
     }
 
     private suspend fun processIncomingFrame(cameraId: String, bitmap: android.graphics.Bitmap) {
