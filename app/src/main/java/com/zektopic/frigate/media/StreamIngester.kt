@@ -54,6 +54,11 @@ class StreamIngester(
     private var debugFrameCount = 0
     private var currentRtspUrl: String = config.rtspUrl
     private var hasAttemptedFallback = false
+
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var connectionWatchdogRunnable: Runnable? = null
+    private var frameWatchdogRunnable: Runnable? = null
+    @Volatile private var lastFrameTime = 0L
  
     fun start() {
         if (isIngesting) return
@@ -319,8 +324,38 @@ class StreamIngester(
                                 }
                             }
                         })
-
+ 
+                        lastFrameTime = 0L
                         player.prepare()
+
+                        // Setup connection watchdog
+                        val myGen = generation.get()
+                        connectionWatchdogRunnable = Runnable {
+                            if (isIngesting && generation.get() == myGen) {
+                                if (exoPlayer?.playbackState != androidx.media3.common.Player.STATE_READY || lastFrameTime == 0L) {
+                                    Log.w(tag, "Connection watchdog triggered: stream failed to connect or produce frames within 6.5 seconds. Falling back to simulation.")
+                                    cleanupMediaPlayer()
+                                    startRtspSimulationFallback()
+                                }
+                            }
+                        }
+                        connectionWatchdogRunnable?.let { mainHandler.postDelayed(it, 6500) }
+
+                        // Setup frame freeze watchdog
+                        frameWatchdogRunnable = Runnable {
+                            if (isIngesting && generation.get() == myGen) {
+                                val now = System.currentTimeMillis()
+                                if (lastFrameTime > 0L && now - lastFrameTime > 8000L) {
+                                    Log.w(tag, "Frame watchdog triggered: no frames received for 8 seconds. Falling back to simulation.")
+                                    cleanupMediaPlayer()
+                                    startRtspSimulationFallback()
+                                } else {
+                                    frameWatchdogRunnable?.let { mainHandler.postDelayed(it, 4000) }
+                                }
+                            }
+                        }
+                        frameWatchdogRunnable?.let { mainHandler.postDelayed(it, 8000) }
+
                     } catch (e: Exception) {
                         Log.e(tag, "Failed to initialize ExoPlayer. Falling back to simulation.", e)
                         cleanupMediaPlayer()
@@ -398,6 +433,7 @@ class StreamIngester(
                         val flipped = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, false)
                         bitmap.recycle()
 
+                        lastFrameTime = System.currentTimeMillis()
                         debugFrameCount++
                         if (debugFrameCount % 30 == 1) {
                             val pixel = flipped.getPixel(flipped.width / 2, flipped.height / 2)
@@ -430,24 +466,157 @@ class StreamIngester(
         Log.d(tag, "RTSP Client starting simulation fallback for stream: ${config.rtspUrl}")
         rtspSimulationExecutor = Executors.newSingleThreadScheduledExecutor()
         val intervalMs = 1000L / config.fps
+
+        var boxX = 50f
+        var boxY = 80f
+        var dx = 5f
+        var dy = 4f
+        val boxWidth = 140f
+        val boxHeight = 90f
+
         rtspSimulationExecutor?.scheduleAtFixedRate({
             if (isIngesting) {
-                val bitmap = Bitmap.createBitmap(config.detectWidth, config.detectHeight, Bitmap.Config.ARGB_8888)
+                val width = config.detectWidth
+                val height = config.detectHeight
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                 val canvas = android.graphics.Canvas(bitmap)
-                canvas.drawColor(android.graphics.Color.DKGRAY)
+
+                // Base background color (Dark Tech Blue-Gray)
+                canvas.drawColor(0xFF0F1015.toInt())
+
                 val paint = android.graphics.Paint().apply {
-                    color = android.graphics.Color.WHITE
-                    textSize = 20f
                     isAntiAlias = true
                 }
-                canvas.drawText("${config.name} RTSP Stream", 20f, 40f, paint)
-                canvas.drawText("Time: ${System.currentTimeMillis()}", 20f, 70f, paint)
+
+                // 1. Subtle Grid Lines
+                paint.color = 0xFF1D202D.toInt()
+                paint.strokeWidth = 1f
+                val gridSpacing = 40f
+                var x = 0f
+                while (x < width) {
+                    canvas.drawLine(x, 0f, x, height.toFloat(), paint)
+                    x += gridSpacing
+                }
+                var y = 0f
+                while (y < height) {
+                    canvas.drawLine(0f, y, width.toFloat(), y, paint)
+                    y += gridSpacing
+                }
+
+                val pad = 15f
+
+                // 2. Outer Viewfinder Corner Brackets
+                paint.color = 0xFF00F0FF.toInt() // Cyber Cyan
+                paint.style = android.graphics.Paint.Style.STROKE
+                paint.strokeWidth = 3f
+                val bracketLen = 20f
+
+                // Top-Left
+                canvas.drawLine(pad, pad, pad + bracketLen, pad, paint)
+                canvas.drawLine(pad, pad, pad, pad + bracketLen, paint)
+
+                // Top-Right
+                canvas.drawLine(width - pad, pad, width - pad - bracketLen, pad, paint)
+                canvas.drawLine(width - pad, pad, width - pad, pad + bracketLen, paint)
+
+                // Bottom-Left
+                canvas.drawLine(pad, height - pad, pad + bracketLen, height - pad, paint)
+                canvas.drawLine(pad, height - pad, pad, height - pad - bracketLen, paint)
+
+                // Bottom-Right
+                canvas.drawLine(width - pad, height - pad, width - pad - bracketLen, height - pad, paint)
+                canvas.drawLine(width - pad, height - pad, width - pad, height - pad - bracketLen, paint)
+
+                // 3. Simulated Center Target Crosshair
+                paint.color = 0x4000F0FF.toInt() // Semi-transparent Cyan
+                paint.strokeWidth = 1.5f
+                val centerX = width / 2f
+                val centerY = height / 2f
+                canvas.drawLine(centerX - 15f, centerY, centerX + 15f, centerY, paint)
+                canvas.drawLine(centerX, centerY - 15f, centerX, centerY + 15f, paint)
+                canvas.drawCircle(centerX, centerY, 8f, paint)
+
+                // 4. Update and Draw Bouncing "Object Detected" Bounding Box
+                boxX += dx
+                boxY += dy
+                if (boxX < pad || boxX + boxWidth > width - pad) {
+                    dx = -dx
+                    boxX = Math.max(pad, Math.min(boxX, width - pad - boxWidth))
+                }
+                if (boxY < pad + 30f || boxY + boxHeight > height - pad) {
+                    dy = -dy
+                    boxY = Math.max(pad + 30f, Math.min(boxY, height - pad - boxHeight))
+                }
+
+                // Draw bounding box (Electric Emerald)
+                paint.color = 0xFF10B981.toInt()
+                paint.style = android.graphics.Paint.Style.STROKE
+                paint.strokeWidth = 2f
+                canvas.drawRect(boxX, boxY, boxX + boxWidth, boxY + boxHeight, paint)
+
+                // Bounding box fill
+                paint.style = android.graphics.Paint.Style.FILL
+                paint.color = 0x1510B981.toInt()
+                canvas.drawRect(boxX, boxY, boxX + boxWidth, boxY + boxHeight, paint)
+
+                // Label
+                paint.color = 0xFF10B981.toInt()
+                paint.textSize = 12f
+                paint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD)
+                canvas.drawText("PERSON: 94%", boxX + 4f, boxY - 6f, paint)
+
+                // 5. HUD Text Overlay
+                paint.color = 0xFFFFFFFF.toInt()
+                paint.textSize = 13f
+                paint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.NORMAL)
+                canvas.drawText("CAM: ${config.name.toUpperCase()}", 25f, 35f, paint)
+
+                // Blinking Warning Amber dot & "SIMULATION"
+                val isBlinkOn = (System.currentTimeMillis() / 500) % 2 == 0L
+                if (isBlinkOn) {
+                    paint.color = 0xFFF59E0B.toInt() // Warning Amber
+                    canvas.drawCircle(30f, 52f, 4f, paint)
+                    paint.textSize = 11f
+                    canvas.drawText("SIMULATION ACTIVE", 42f, 56f, paint)
+                }
+
+                // Clock overlay
+                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
+                val dateStr = sdf.format(java.util.Date())
+                paint.color = 0xFF9CA3AF.toInt() // Cool gray
+                paint.textSize = 11f
+                canvas.drawText(dateStr, 25f, height - 25f, paint)
+
+                // Stream metadata
+                canvas.drawText("RES: ${config.detectWidth}x${config.detectHeight} @ ${config.fps}FPS", width - 190f, 35f, paint)
+
+                // Moving Sine Wave Graphic at bottom right
+                paint.color = 0xFF00F0FF.toInt() // Cyber Cyan
+                paint.style = android.graphics.Paint.Style.STROKE
+                paint.strokeWidth = 1.5f
+                val wavePath = android.graphics.Path()
+                val startX = width - 150f
+                val baseLineY = height - 28f
+                wavePath.moveTo(startX, baseLineY)
+                val timeFactor = System.currentTimeMillis() / 100.0
+                for (px in 0..120 step 4) {
+                    val angle = (px / 120.0) * Math.PI * 4 + timeFactor
+                    val py = baseLineY + Math.sin(angle).toFloat() * 6f
+                    wavePath.lineTo(startX + px, py)
+                }
+                canvas.drawPath(wavePath, paint)
+
                 onFrameExtracted(bitmap)
             }
         }, 0, intervalMs, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
  
     private fun cleanupMediaPlayer() {
+        connectionWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        connectionWatchdogRunnable = null
+        frameWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        frameWatchdogRunnable = null
+
         val playerToRelease = exoPlayer
         exoPlayer = null
         if (playerToRelease != null) {
@@ -798,11 +967,22 @@ class RtspInterceptionSocketFactory(private val tag: String) : javax.net.SocketF
 
 class RtspInterceptionSocket(private val delegate: java.net.Socket, private val tag: String) : java.net.Socket() {
     override fun connect(endpoint: java.net.SocketAddress?) {
-        delegate.connect(endpoint)
+        try {
+            delegate.connect(endpoint, 4000)
+        } catch (e: Exception) {
+            Log.e(tag, "Socket connect failed: ${e.message}")
+            throw e
+        }
     }
-
+ 
     override fun connect(endpoint: java.net.SocketAddress?, timeout: Int) {
-        delegate.connect(endpoint, timeout)
+        val enforcedTimeout = if (timeout <= 0 || timeout > 4000) 4000 else timeout
+        try {
+            delegate.connect(endpoint, enforcedTimeout)
+        } catch (e: Exception) {
+            Log.e(tag, "Socket connect with timeout failed: ${e.message}")
+            throw e
+        }
     }
 
     override fun bind(bindpoint: java.net.SocketAddress?) {

@@ -6,6 +6,9 @@ import android.widget.MediaController
 import android.graphics.Bitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.alpha
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -585,21 +588,70 @@ fun CameraLiveFeedCard(camera: CameraConfigEntity, latestFrame: Bitmap?, isServi
                             contentScale = androidx.compose.ui.layout.ContentScale.Crop
                         )
                     } else {
-                        // Background scanline/mesh effects to mimic terminal monitor
+                        // Scanning background lines
                         Column(
                             modifier = Modifier.fillMaxSize(),
                             verticalArrangement = Arrangement.SpaceBetween
                         ) {
                             repeat(9) {
-                                Divider(color = Color.White.copy(alpha = 0.015f), thickness = 1.dp)
+                                Divider(color = Color.White.copy(alpha = 0.02f), thickness = 1.dp)
                             }
                         }
-                        Icon(
-                            imageVector = Icons.Default.FilterCenterFocus,
-                            contentDescription = "Focus Area",
-                            tint = if (detectedObject != null && isDetectEnabled) HotPink.copy(alpha = 0.6f) else CyberCyan.copy(alpha = 0.3f),
-                            modifier = Modifier.size(48.dp)
-                        )
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center,
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            val infiniteTransition = rememberInfiniteTransition(label = "Connecting")
+                            val rotation by infiniteTransition.animateFloat(
+                                initialValue = 0f,
+                                targetValue = 360f,
+                                animationSpec = infiniteRepeatable(
+                                    animation = tween(2000, easing = LinearEasing),
+                                    repeatMode = RepeatMode.Restart
+                                ),
+                                label = "Rotation"
+                            )
+                            val scale by infiniteTransition.animateFloat(
+                                initialValue = 0.85f,
+                                targetValue = 1.15f,
+                                animationSpec = infiniteRepeatable(
+                                    animation = tween(1000, easing = FastOutSlowInEasing),
+                                    repeatMode = RepeatMode.Reverse
+                                ),
+                                label = "Scale"
+                            )
+                            
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.FilterCenterFocus,
+                                    contentDescription = "Connecting Feed",
+                                    tint = CyberCyan.copy(alpha = 0.6f),
+                                    modifier = Modifier
+                                        .size(54.dp)
+                                        .graphicsLayer(
+                                            scaleX = scale,
+                                            scaleY = scale,
+                                            rotationZ = rotation
+                                        )
+                                )
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(72.dp),
+                                    color = CyberCyan.copy(alpha = 0.8f),
+                                    strokeWidth = 2.dp,
+                                    trackColor = Color.Transparent
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "ESTABLISHING RTSP HANDSHAKE...",
+                                color = CyberCyan,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 1.5.sp,
+                                modifier = Modifier.alpha(scale)
+                            )
+                        }
                     }
 
                     // Draw motion alert reticle boundary box
