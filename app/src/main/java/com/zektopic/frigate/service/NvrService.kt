@@ -16,6 +16,7 @@ import com.zektopic.frigate.MainActivity
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
 import com.zektopic.frigate.media.StreamIngester
+import com.zektopic.frigate.media.HevcDecoderChecker
 import dagger.hilt.android.AndroidEntryPoint
 import android.graphics.Bitmap
 import kotlinx.coroutines.*
@@ -63,6 +64,9 @@ class NvrService : Service(), LifecycleOwner {
         // Initialize and start embedded Ktor web server
         webServer = com.zektopic.frigate.server.EmbeddedWebServer(this, nvrDao)
         webServer?.start()
+
+        // Log HEVC decoder capabilities for debugging
+        HevcDecoderChecker.logHevcCapabilities()
 
         Log.i(tag, "NVR Foreground Service created. Web Server initialized.")
     }

@@ -1,9 +1,11 @@
 package com.zektopic.frigate.ui.dashboard
 
+import android.util.Log
 import android.widget.Toast
 import android.widget.VideoView
 import android.widget.MediaController
 import android.graphics.Bitmap
+import com.zektopic.frigate.media.HevcDecoderChecker
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.animation.*
 import androidx.compose.foundation.Canvas
@@ -1032,10 +1034,21 @@ fun RecordingsScreen(events: List<EventEntity>) {
 
 @Composable
 fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
+    val isHevc = remember(videoUrl) { HevcDecoderChecker.isHevcContent(videoUrl) }
+    val hevcSupported = remember { HevcDecoderChecker.isHevcDecodingSupported() }
+    var playbackError by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        HevcDecoderChecker.logHevcCapabilities()
+    }
+
+    val hevcUnsupported = isHevc && !hevcSupported
+    val showError = hevcUnsupported || playbackError
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, CyberCyan, RoundedCornerShape(16.dp)),
+            .border(1.dp, if (showError) ErrorRed else CyberCyan, RoundedCornerShape(16.dp)),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = CardCarbon)
     ) {
@@ -1046,10 +1059,10 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "RECORDING SEGMENT PLAYER",
+                    text = if (showError) "RECORDING SEGMENT PLAYER — ERROR" else "RECORDING SEGMENT PLAYER",
                     fontWeight = FontWeight.Bold,
                     fontSize = 12.sp,
-                    color = CyberCyan
+                    color = if (showError) ErrorRed else CyberCyan
                 )
                 IconButton(onClick = onClose, modifier = Modifier.size(24.dp)) {
                     Icon(imageVector = Icons.Default.Close, contentDescription = "Close Video", tint = HotPink)
@@ -1063,38 +1076,80 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                     .clip(RoundedCornerShape(8.dp))
                     .background(Color.Black)
             ) {
-                AndroidView(
-                    factory = { context ->
-                        VideoView(context).apply {
-                            setVideoPath(videoUrl)
-                            tag = videoUrl
-                            val mediaController = MediaController(context)
-                            mediaController.setAnchorView(this)
-                            setMediaController(mediaController)
-                            setOnPreparedListener { mp ->
-                                mp.isLooping = true
-                                start()
+                if (showError) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayDisabled,
+                            contentDescription = "Playback Error",
+                            tint = ErrorRed,
+                            modifier = Modifier.size(48.dp)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = if (hevcUnsupported)
+                                "H.265/HEVC Decoding is Not Supported on this Device (API Level ${android.os.Build.VERSION.SDK_INT} / Hardware constraint)"
+                            else
+                                "Playback Error: Failed to Decode H.265 Stream",
+                            color = ErrorRed,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "File Stream: $videoUrl",
+                            fontSize = 9.sp,
+                            color = SoftGray,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                } else {
+                    AndroidView(
+                        factory = { ctx ->
+                            VideoView(ctx).apply {
+                                setVideoPath(videoUrl)
+                                tag = videoUrl
+                                val mediaController = MediaController(ctx)
+                                mediaController.setAnchorView(this)
+                                setMediaController(mediaController)
+                                setOnPreparedListener { mp ->
+                                    mp.isLooping = true
+                                    start()
+                                }
+                                setOnErrorListener { _, what, extra ->
+                                    Log.e("VideoPlayer", "Playback error for $videoUrl: what=$what, extra=$extra (0x${Integer.toHexString(extra)})")
+                                    playbackError = true
+                                    true
+                                }
                             }
-                        }
-                    },
-                    update = { view ->
-                        // Guard to avoid resetting same path during recomposition
-                        if (view.tag != videoUrl) {
-                            view.setVideoPath(videoUrl)
-                            view.tag = videoUrl
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
+                        },
+                        update = { view ->
+                            if (view.tag != videoUrl) {
+                                view.setVideoPath(videoUrl)
+                                view.tag = videoUrl
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
             }
 
-            Text(
-                text = "File Stream: $videoUrl",
-                fontSize = 9.sp,
-                color = SoftGray,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            if (!showError) {
+                Text(
+                    text = "File Stream: $videoUrl",
+                    fontSize = 9.sp,
+                    color = SoftGray,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
