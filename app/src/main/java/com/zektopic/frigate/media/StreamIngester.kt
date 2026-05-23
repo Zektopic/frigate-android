@@ -260,7 +260,29 @@ class StreamIngester(
                         return@post
                     }
                     try {
-                        val player = androidx.media3.exoplayer.ExoPlayer.Builder(context).build()
+                        val customSelector = androidx.media3.exoplayer.mediacodec.MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+                            val decoderInfos = androidx.media3.exoplayer.mediacodec.MediaCodecSelector.DEFAULT.getDecoderInfos(
+                                mimeType, requiresSecureDecoder, requiresTunnelingDecoder
+                            ).toMutableList()
+                            
+                            if (mimeType.equals("video/hevc", ignoreCase = true)) {
+                                decoderInfos.sortWith(Comparator { codec1, codec2 ->
+                                    val isSw1 = codec1.name.startsWith("OMX.google.", ignoreCase = true) || 
+                                                codec1.name.startsWith("c2.android.", ignoreCase = true)
+                                    val isSw2 = codec2.name.startsWith("OMX.google.", ignoreCase = true) || 
+                                                codec2.name.startsWith("c2.android.", ignoreCase = true)
+                                    if (isSw1 && !isSw2) -1 else if (!isSw1 && isSw2) 1 else 0
+                                })
+                                Log.d(tag, "MediaCodecSelector sorted HEVC decoders: ${decoderInfos.map { it.name }}")
+                            }
+                            decoderInfos
+                        }
+
+                        val renderersFactory = androidx.media3.exoplayer.DefaultRenderersFactory(context)
+                            .setMediaCodecSelector(customSelector)
+                            .setEnableDecoderFallback(true)
+
+                        val player = androidx.media3.exoplayer.ExoPlayer.Builder(context, renderersFactory).build()
                         exoPlayer = player
                         
                         val mediaItem = androidx.media3.common.MediaItem.fromUri(currentRtspUrl)
