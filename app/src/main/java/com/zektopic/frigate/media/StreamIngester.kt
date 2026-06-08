@@ -19,6 +19,8 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 class StreamIngester(
     private val context: Context,
@@ -32,8 +34,8 @@ class StreamIngester(
     private var cameraExecutor: ExecutorService? = null
     private var cameraProvider: ProcessCameraProvider? = null
 
-    // RTSP properties
-    private var rtspSimulationExecutor: java.util.concurrent.ScheduledExecutorService? = null
+    // Real stream decoder for RTSP/HTTP streams
+    private var realDecoder: RealStreamDecoder? = null
 
     fun start() {
         if (isIngesting) return
@@ -41,11 +43,11 @@ class StreamIngester(
         Log.i(tag, "Starting stream ingestion for ${config.name}...")
 
         if (config.rtspUrl.isEmpty()) {
-            // Local physical camera
+            // Local physical camera via CameraX
             startLocalCameraIngestion()
         } else {
-            // External RTSP camera
-            startRtspIngestion()
+            // External RTSP/HTTP stream via hardware decoder
+            startRemoteStreamIngestion()
         }
     }
 
@@ -64,15 +66,40 @@ class StreamIngester(
         }
         cameraProvider = null
 
+        // Stop real stream decoder
+        realDecoder?.stop()
+        realDecoder = null
+    }
 
+    /**
+     * Start a real hardware-accelerated stream decoder for remote RTSP/HTTP streams.
+     * Uses MediaCodec to decode frames and passes them to the AI pipeline.
+     */
+    private fun startRemoteStreamIngestion() {
+        Log.d(tag, "Starting real stream decoder for: ${config.rtspUrl}")
 
-        // Stop RTSP Simulation
-        rtspSimulationExecutor?.shutdown()
-        rtspSimulationExecutor = null
+        realDecoder = RealStreamDecoder(
+            streamUrl = config.rtspUrl,
+            targetWidth = config.detectWidth,
+            targetHeight = config.detectHeight,
+            targetFps = config.fps
+        )
+
+        realDecoder!!.setOnFrameCallback { bitmap ->
+            if (isIngesting) {
+                onFrameExtracted(bitmap)
+            }
+        }
+
+        realDecoder!!.setOnErrorCallback { errorMsg ->
+            Log.e(tag, "Stream decoder error: $errorMsg")
+        }
+
+        realDecoder!!.start()
     }
 
     private fun startLocalCameraIngestion() {
-        if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             Log.e(tag, "Cannot start local camera ingestion: CAMERA permission not granted.")
             return
         }
@@ -116,7 +143,6 @@ class StreamIngester(
                 val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
                 
                 // Note: In an Android service context, we bind this analyzer to the Service's lifecycle.
-                // We assume the service provides a lifecycle owner, or we bind it using a LifecycleRegistry.
                 if (context is LifecycleOwner) {
                     cameraProvider?.bindToLifecycle(
                         context,
@@ -132,27 +158,6 @@ class StreamIngester(
                 Log.e(tag, "Failed to start local camera ingestion", e)
             }
         }, ContextCompat.getMainExecutor(context))
-    }
-
-    private fun startRtspIngestion() {
-        Log.d(tag, "RTSP Client starting simulation for stream: ${config.rtspUrl}")
-        rtspSimulationExecutor = Executors.newSingleThreadScheduledExecutor()
-        val intervalMs = 1000L / config.fps
-        rtspSimulationExecutor?.scheduleAtFixedRate({
-            if (isIngesting) {
-                val bitmap = Bitmap.createBitmap(config.detectWidth, config.detectHeight, Bitmap.Config.ARGB_8888)
-                val canvas = android.graphics.Canvas(bitmap)
-                canvas.drawColor(android.graphics.Color.DKGRAY)
-                val paint = android.graphics.Paint().apply {
-                    color = android.graphics.Color.WHITE
-                    textSize = 20f
-                    isAntiAlias = true
-                }
-                canvas.drawText("${config.name} RTSP Stream", 20f, 40f, paint)
-                canvas.drawText("Time: ${System.currentTimeMillis()}", 20f, 70f, paint)
-                onFrameExtracted(bitmap)
-            }
-        }, 0, intervalMs, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
     // Helper extension function to convert CameraX YUV_420_888 ImageProxy to Bitmap
