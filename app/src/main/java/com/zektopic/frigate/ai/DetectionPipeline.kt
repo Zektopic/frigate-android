@@ -12,6 +12,7 @@ import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.EventEntity
 import com.zektopic.frigate.data.NvrDao
 import com.zektopic.frigate.media.ClipRecorder
+import com.zektopic.frigate.mqtt.MqttClient
 import com.zektopic.frigate.notification.AlertManager
 import com.zektopic.frigate.ui.zones.GeometryEngine
 import java.io.File
@@ -43,6 +44,9 @@ class DetectionPipeline(
     private val alertManager = AlertManager(context)
     private val motionDetectors = ConcurrentHashMap<String, MotionDetector>()
     private val lastDetectionTime = ConcurrentHashMap<String, Long>()
+
+    // MQTT client for Home Assistant / external automation integration
+    var mqttClient: MqttClient? = null
 
     // Pipeline state
     private val pipelineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -272,6 +276,15 @@ class DetectionPipeline(
             label = primaryDetection.label,
             confidence = maxConfidence,
             snapshotFile = snapshotFile
+        )
+
+        // 4. Publish to MQTT for Home Assistant integration
+        mqttClient?.publishEvent(
+            cameraId = cameraId,
+            label = primaryDetection.label,
+            confidence = maxConfidence,
+            zone = "Main Zone",
+            snapshotPath = snapshotPath
         )
 
         Log.i(tag, "Event: ${labels.joinToString()} on $cameraId " +
