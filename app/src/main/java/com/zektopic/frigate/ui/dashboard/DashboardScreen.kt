@@ -1,12 +1,18 @@
 package com.zektopic.frigate.ui.dashboard
 
-import android.util.Log
-import android.widget.Toast
-import android.widget.VideoView
-import android.widget.MediaController
 import android.graphics.Bitmap
-import com.zektopic.frigate.media.HevcDecoderChecker
+import android.net.Uri
+import android.util.Log
+import android.view.TextureView
+import android.widget.Toast
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
+import com.zektopic.frigate.media.HevcDecoderChecker
 import androidx.compose.animation.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -1033,13 +1039,63 @@ fun RecordingsScreen(events: List<EventEntity>) {
 }
 
 @Composable
-fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
+fun VideoPlayer(
+    videoUrl: String,
+    onClose: () -> Unit,
+    enableFrameExtraction: Boolean = false,
+    onFrameAvailable: ((Bitmap) -> Unit)? = null
+) {
     val isHevc = remember(videoUrl) { HevcDecoderChecker.isHevcContent(videoUrl) }
     val hevcSupported = remember { HevcDecoderChecker.isHevcDecodingSupported() }
     var playbackError by remember { mutableStateOf(false) }
+    var isPlaying by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) {
-        HevcDecoderChecker.logHevcCapabilities()
+    // ExoPlayer instance with custom codec selector that prefers hardware decoders
+    val context = LocalContext.current
+    val player = remember {
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(
+                androidx.media3.exoplayer.source.DefaultMediaSourceFactory(context)
+                    .setLiveTargetOffsetMs(5000)
+            )
+            .build()
+            .apply {
+                repeatMode = Player.REPEAT_MODE_ALL
+                playWhenReady = true
+                addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(state: Int) {
+                        isPlaying = state == Player.STATE_READY
+                    }
+                    override fun onPlayerError(error: PlaybackException) {
+                        Log.e("VideoPlayer", "ExoPlayer error: ${error.message}", error)
+                        playbackError = true
+                    }
+                })
+            }
+    }
+
+    // Build the appropriate MediaSource based on URL
+    LaunchedEffect(videoUrl) {
+        try {
+            Log.d("VideoPlayer", "Loading media: $videoUrl")
+            Log.d("VideoPlayer", "HEVC content: $isHevc, supported: $hevcSupported")
+
+            val mediaItem = MediaItem.fromUri(Uri.parse(videoUrl))
+
+            // Let ExoPlayer auto-detect the media source type
+            player.setMediaItem(mediaItem)
+            player.prepare()
+        } catch (e: Exception) {
+            Log.e("VideoPlayer", "Failed to prepare media: ${e.message}", e)
+            playbackError = true
+        }
+    }
+
+    // Cleanup player on dispose
+    DisposableEffect(Unit) {
+        onDispose {
+            player.release()
+        }
     }
 
     val hevcUnsupported = isHevc && !hevcSupported
@@ -1064,8 +1120,16 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                     fontSize = 12.sp,
                     color = if (showError) ErrorRed else CyberCyan
                 )
-                IconButton(onClick = onClose, modifier = Modifier.size(24.dp)) {
-                    Icon(imageVector = Icons.Default.Close, contentDescription = "Close Video", tint = HotPink)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = if (isPlaying) "● LIVE" else "● BUFFERING",
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isPlaying) ElectricEmerald else WarningYellow
+                    )
+                    IconButton(onClick = onClose, modifier = Modifier.size(24.dp)) {
+                        Icon(imageVector = Icons.Default.Close, contentDescription = "Close", tint = HotPink)
+                    }
                 }
             }
 
@@ -1093,9 +1157,9 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
                             text = if (hevcUnsupported)
-                                "H.265/HEVC Decoding is Not Supported on this Device (API Level ${android.os.Build.VERSION.SDK_INT} / Hardware constraint)"
+                                "H.265/HEVC Decoding is Not Supported on this Device (API ${android.os.Build.VERSION.SDK_INT})"
                             else
-                                "Playback Error: Failed to Decode H.265 Stream",
+                                "Playback Error: ${if (playbackError) "Decode failure" else "Unknown"}",
                             color = ErrorRed,
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp,
@@ -1103,7 +1167,7 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "File Stream: $videoUrl",
+                            text = videoUrl,
                             fontSize = 9.sp,
                             color = SoftGray,
                             maxLines = 1,
@@ -1113,27 +1177,10 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                 } else {
                     AndroidView(
                         factory = { ctx ->
-                            VideoView(ctx).apply {
-                                setVideoPath(videoUrl)
-                                tag = videoUrl
-                                val mediaController = MediaController(ctx)
-                                mediaController.setAnchorView(this)
-                                setMediaController(mediaController)
-                                setOnPreparedListener { mp ->
-                                    mp.isLooping = true
-                                    start()
-                                }
-                                setOnErrorListener { _, what, extra ->
-                                    Log.e("VideoPlayer", "Playback error for $videoUrl: what=$what, extra=$extra (0x${Integer.toHexString(extra)})")
-                                    playbackError = true
-                                    true
-                                }
-                            }
-                        },
-                        update = { view ->
-                            if (view.tag != videoUrl) {
-                                view.setVideoPath(videoUrl)
-                                view.tag = videoUrl
+                            PlayerView(ctx).apply {
+                                this.player = player
+                                useController = true
+                                setBackgroundColor(android.graphics.Color.BLACK)
                             }
                         },
                         modifier = Modifier.fillMaxSize()
@@ -1143,7 +1190,7 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
 
             if (!showError) {
                 Text(
-                    text = "File Stream: $videoUrl",
+                    text = videoUrl,
                     fontSize = 9.sp,
                     color = SoftGray,
                     maxLines = 1,
