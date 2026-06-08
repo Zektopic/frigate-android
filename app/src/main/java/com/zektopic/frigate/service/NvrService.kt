@@ -16,6 +16,7 @@ import com.zektopic.frigate.MainActivity
 import com.zektopic.frigate.ai.DetectionPipeline
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
+import com.zektopic.frigate.media.ClipRecorder
 import com.zektopic.frigate.media.StreamIngester
 import com.zektopic.frigate.media.HevcDecoderChecker
 import dagger.hilt.android.AndroidEntryPoint
@@ -48,8 +49,11 @@ class NvrService : Service(), LifecycleOwner {
         return latestFramesMap[cameraId]
     }
 
-    // AI Detection Pipeline (replaces old motion-only processing)
+    // AI Detection Pipeline
     private var detectionPipeline: DetectionPipeline? = null
+
+    // Clip Recorder with real EventRecorder for pre-buffer recordings
+    private var clipRecorder: ClipRecorder? = null
 
     // Embedded Ktor Web Server
     private var webServer: com.zektopic.frigate.server.EmbeddedWebServer? = null
@@ -64,6 +68,10 @@ class NvrService : Service(), LifecycleOwner {
         // Log hardware decoder capabilities
         com.zektopic.frigate.media.RealStreamDecoder.logHardwareDecoderCapabilities()
         HevcDecoderChecker.logHevcCapabilities()
+
+        // Initialize Clip Recorder with event recording
+        Log.i(tag, "Initializing ClipRecorder with EventRecorder...")
+        clipRecorder = ClipRecorder(this, nvrDao)
 
         // Initialize AI Detection Pipeline
         Log.i(tag, "Initializing Frigate AI Detection Pipeline...")
@@ -133,6 +141,10 @@ class NvrService : Service(), LifecycleOwner {
         Log.i(tag, "NVR Foreground Service destroying...")
         serviceScope.cancel()
 
+        // Stop clip recorders
+        clipRecorder?.stopAll()
+        clipRecorder = null
+
         // Safely stop all stream ingesters
         synchronized(activeIngesters) {
             for ((cameraId, ingester) in activeIngesters) {
@@ -171,6 +183,9 @@ class NvrService : Service(), LifecycleOwner {
                     // Cache frame for UI and Ktor clients
                     latestFramesMap[camera.id] = frameBitmap
                     _frameFlow.tryEmit(Pair(camera.id, frameBitmap))
+
+                    // Feed frame to recording ring buffer
+                    clipRecorder?.feedFrameForPreBuffer(camera.id, frameBitmap)
 
                     // Route frame through the full AI detection pipeline
                     serviceScope.launch(Dispatchers.Default) {

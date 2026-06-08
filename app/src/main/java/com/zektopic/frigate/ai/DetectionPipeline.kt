@@ -244,20 +244,29 @@ class DetectionPipeline(
         val labels = results.map { it.label }.distinct()
         val maxConfidence = results.maxOf { it.confidence }
 
-        val snapshotFile = clipRecorder.saveEventSnapshot(cameraId, primaryDetection.label, frame)
+        // 1. Save snapshot and trigger event recording (with pre-buffer)
+        val (snapshotPath, clipPath) = clipRecorder.triggerEventRecording(
+            cameraId = cameraId,
+            eventType = primaryDetection.label,
+            confidence = maxConfidence,
+            currentFrame = frame
+        )
 
+        // 2. Create event record in database
         val event = EventEntity(
             cameraId = cameraId,
             label = labels.joinToString(","),
             confidence = maxConfidence,
             timestamp = currentTime,
-            snapshotPath = snapshotFile?.absolutePath,
-            videoPath = null,
+            snapshotPath = snapshotPath,
+            videoPath = clipPath,
             zone = "Main Zone"
         )
 
         nvrDao.insertEvent(event)
 
+        // 3. Push notification
+        val snapshotFile = snapshotPath?.let { File(it) }
         alertManager.postDetectionAlert(
             cameraId = cameraId,
             label = primaryDetection.label,
@@ -272,18 +281,24 @@ class DetectionPipeline(
     /** Motion-only fallback event */
     private suspend fun createMotionEvent(cameraId: String, frame: Bitmap) {
         val currentTime = System.currentTimeMillis()
-        val snapshotFile = clipRecorder.saveEventSnapshot(cameraId, "motion", frame)
+        val (snapshotPath, clipPath) = clipRecorder.triggerEventRecording(
+            cameraId = cameraId,
+            eventType = "motion",
+            confidence = 1.0f,
+            currentFrame = frame
+        )
 
         val event = EventEntity(
             cameraId = cameraId,
             label = "motion",
             confidence = 1.0f,
             timestamp = currentTime,
-            snapshotPath = snapshotFile?.absolutePath,
-            videoPath = null,
+            snapshotPath = snapshotPath,
+            videoPath = clipPath,
             zone = "Main Zone"
         )
         nvrDao.insertEvent(event)
+        val snapshotFile = snapshotPath?.let { File(it) }
         alertManager.postDetectionAlert(cameraId = cameraId, label = "Motion", confidence = 1.0f, snapshotFile = snapshotFile)
     }
 
