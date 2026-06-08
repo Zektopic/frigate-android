@@ -13,6 +13,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import com.zektopic.frigate.FrigateApp
 import com.zektopic.frigate.MainActivity
+import com.zektopic.frigate.ai.DetectionPipeline
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
 import com.zektopic.frigate.media.StreamIngester
@@ -34,10 +35,6 @@ class NvrService : Service(), LifecycleOwner {
     private val activeIngesters = mutableMapOf<String, StreamIngester>()
     private val lifecycleRegistry = LifecycleRegistry(this)
 
-    // Motion variables
-    private val motionDetectors = mutableMapOf<String, com.zektopic.frigate.ai.MotionDetector>()
-    private val lastEventTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
-
     // Live Frame flow and cache
     private val latestFramesMap = java.util.concurrent.ConcurrentHashMap<String, Bitmap>()
     private val _frameFlow = MutableSharedFlow<Pair<String, Bitmap>>(
@@ -51,6 +48,9 @@ class NvrService : Service(), LifecycleOwner {
         return latestFramesMap[cameraId]
     }
 
+    // AI Detection Pipeline (replaces old motion-only processing)
+    private var detectionPipeline: DetectionPipeline? = null
+
     // Embedded Ktor Web Server
     private var webServer: com.zektopic.frigate.server.EmbeddedWebServer? = null
 
@@ -60,21 +60,27 @@ class NvrService : Service(), LifecycleOwner {
     override fun onCreate() {
         super.onCreate()
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
-        
+
+        // Log hardware decoder capabilities
+        com.zektopic.frigate.media.RealStreamDecoder.logHardwareDecoderCapabilities()
+        HevcDecoderChecker.logHevcCapabilities()
+
+        // Initialize AI Detection Pipeline
+        Log.i(tag, "Initializing Frigate AI Detection Pipeline...")
+        detectionPipeline = DetectionPipeline(this, nvrDao)
+        detectionPipeline?.initialize()
+
         // Initialize and start embedded Ktor web server
         webServer = com.zektopic.frigate.server.EmbeddedWebServer(this, nvrDao)
         webServer?.start()
 
-        // Log HEVC decoder capabilities for debugging
-        HevcDecoderChecker.logHevcCapabilities()
-
-        Log.i(tag, "NVR Foreground Service created. Web Server initialized.")
+        Log.i(tag, "NVR Foreground Service created. Detection pipeline ready.")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
-        
-        // Show persistent status notification to run in background
+
+        // Show persistent status notification
         val hasCameraPermission = checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
         if (android.os.Build.VERSION.SDK_INT >= 29) {
             var type = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
@@ -99,10 +105,10 @@ class NvrService : Service(), LifecycleOwner {
                                     ingester.stop()
                                 }
                                 activeIngesters.clear()
-                                motionDetectors.clear()
                             }
                         } else {
-                            updateNotification("Monitoring ${activeCameras.size} active camera stream(s)")
+                            val aiStatus = if (detectionPipeline?.isAiReady() == true) "AI" else "Motion-Only"
+                            updateNotification("Monitoring ${activeCameras.size} active stream(s) [$aiStatus mode]")
                             startActiveStreams(activeCameras)
                         }
                     }
@@ -126,7 +132,7 @@ class NvrService : Service(), LifecycleOwner {
     override fun onDestroy() {
         Log.i(tag, "NVR Foreground Service destroying...")
         serviceScope.cancel()
-        
+
         // Safely stop all stream ingesters
         synchronized(activeIngesters) {
             for ((cameraId, ingester) in activeIngesters) {
@@ -136,9 +142,11 @@ class NvrService : Service(), LifecycleOwner {
             activeIngesters.clear()
         }
 
+        // Shutdown the AI detection pipeline
+        detectionPipeline?.shutdown()
+        detectionPipeline = null
+
         // Release resources
-        motionDetectors.clear()
-        lastEventTime.clear()
         latestFramesMap.clear()
 
         // Stop web server
@@ -156,21 +164,17 @@ class NvrService : Service(), LifecycleOwner {
                 ingester.stop()
             }
             activeIngesters.clear()
-            motionDetectors.clear()
 
-            // Initialize new ingesters
+            // Initialize new ingesters with AI pipeline integration
             for (camera in cameras) {
-                // Initialize a motion detector for this camera with specific thresholds
-                motionDetectors[camera.id] = com.zektopic.frigate.ai.MotionDetector(camera.motionThreshold)
-
                 val ingester = StreamIngester(this, camera) { frameBitmap ->
-                    // Cache frame and emit for Compose/Ktor clients
+                    // Cache frame for UI and Ktor clients
                     latestFramesMap[camera.id] = frameBitmap
                     _frameFlow.tryEmit(Pair(camera.id, frameBitmap))
 
-                    // Route frame through the gated AI pipeline in a background thread
+                    // Route frame through the full AI detection pipeline
                     serviceScope.launch(Dispatchers.Default) {
-                        processIncomingFrame(camera.id, frameBitmap)
+                        detectionPipeline?.processFrame(camera, frameBitmap)
                     }
                 }
                 activeIngesters[camera.id] = ingester
@@ -179,60 +183,14 @@ class NvrService : Service(), LifecycleOwner {
         }
     }
 
-    private suspend fun processIncomingFrame(cameraId: String, bitmap: android.graphics.Bitmap) {
-        val motionDetector = motionDetectors[cameraId] ?: return
-        
-        // 1. Run low-power motion detection pre-filter
-        val hasMotion = motionDetector.detectMotion(bitmap)
-        if (!hasMotion) return
-
-        // 2. Throttle event logging to once every 10 seconds per camera
-        val currentTime = System.currentTimeMillis()
-        val lastTime = lastEventTime[cameraId] ?: 0L
-        if (currentTime - lastTime >= 10000L) {
-            lastEventTime[cameraId] = currentTime
-            
-            // Insert event into local database
-            nvrDao.insertEvent(
-                com.zektopic.frigate.data.EventEntity(
-                    cameraId = cameraId,
-                    label = "motion",
-                    confidence = 1.0f,
-                    timestamp = currentTime,
-                    snapshotPath = null,
-                    videoPath = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-                    zone = "Main Zone"
-                )
-            )
-
-            // Trigger system alerts for motion detection
-            triggerSystemAlert(cameraId, "motion", 1.0f)
-        }
+    /**
+     * Get current detection pipeline stats for the dashboard
+     */
+    fun getDetectionStats(): DetectionPipeline.PipelineStats {
+        return detectionPipeline?.getStats() ?: DetectionPipeline.PipelineStats()
     }
 
-    private fun triggerSystemAlert(cameraId: String, label: String, confidence: Float) {
-        val notificationManager = androidx.core.app.NotificationManagerCompat.from(this)
-        
-        // Validate runtime permissions
-        if (android.os.Build.VERSION.SDK_INT >= 33) {
-            val permissionState = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-            if (permissionState != android.content.pm.PackageManager.PERMISSION_GRANTED) return
-        }
-
-        val text = "Motion was detected on camera '$cameraId'."
-        val builder = androidx.core.app.NotificationCompat.Builder(this, FrigateApp.CHANNEL_ALERTS)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setContentTitle("Frigate Alert: Motion Detected")
-            .setContentText(text)
-            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-
-        try {
-            notificationManager.notify(label.hashCode() + cameraId.hashCode(), builder.build())
-        } catch (e: SecurityException) {
-            Log.e(tag, "Notification security exception", e)
-        }
-    }
+    fun isAiEnabled(): Boolean = detectionPipeline?.isAiReady() ?: false
 
     private fun createStatusNotification(contentText: String): Notification {
         val notificationIntent = Intent(this, MainActivity::class.java)
@@ -242,7 +200,7 @@ class NvrService : Service(), LifecycleOwner {
         )
 
         return NotificationCompat.Builder(this, FrigateApp.CHANNEL_NVR_STATUS)
-            .setContentTitle("Frigate NVR Service")
+            .setContentTitle("Frigate NVR")
             .setContentText(contentText)
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setContentIntent(pendingIntent)

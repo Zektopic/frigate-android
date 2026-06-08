@@ -105,6 +105,16 @@ dependencies {
     implementation("io.ktor:ktor-server-content-negotiation:$ktorVersion")
     implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
 
+    // TensorFlow Lite for AI object detection with hardware acceleration
+    // Task Vision provides the high-level ObjectDetector API (handles preprocessing)
+    val tfliteTaskVision = "0.4.1"
+    implementation("org.tensorflow:tensorflow-lite-task-vision:$tfliteTaskVision")
+    // GPU delegate (OpenCL/OpenGL ES) for Adreno, Mali, PowerVR GPUs
+    val tfliteGpu = "2.9.0"
+    implementation("org.tensorflow:tensorflow-lite-gpu:$tfliteGpu")
+    // NNAPI delegate (NPU/DSP) for Snapdragon, Exynos, Tensor, Dimensity
+    // (included in core tensorflow-lite, no extra dep needed)
+
     // YAML parsing
     implementation("org.yaml:snakeyaml:2.2")
 
