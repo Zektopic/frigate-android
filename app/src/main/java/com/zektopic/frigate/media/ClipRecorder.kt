@@ -2,8 +2,6 @@ package com.zektopic.frigate.media
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.media.MediaFormat
-import android.media.MediaMuxer
 import android.util.Log
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
@@ -11,24 +9,51 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 
+/**
+ * Clip and snapshot recorder for Frigate Android.
+ *
+ * Handles:
+ * - Event snapshot saving (JPEG)
+ * - Retention policy enforcement
+ * - Delegates to EventRecorder for real MP4 clip recording with pre-buffer
+ */
 class ClipRecorder(
     private val context: Context,
     private val nvrDao: NvrDao
 ) {
     private val tag = "ClipRecorder"
-    
-    // Directory mapping in scoped storage to keep things tidy
+
+    // Directory for recordings in scoped storage
     private val baseRecordingsDir: File by lazy {
         File(context.getExternalFilesDir(null), "frigate_recordings").apply {
             if (!exists()) mkdirs()
         }
     }
 
+    // Active EventRecorder instances per camera
+    private val eventRecorders = mutableMapOf<String, EventRecorder>()
+
     /**
-     * Records a video segment or saves a high-quality frame snapshot when an object is detected.
+     * Get or create an EventRecorder for a specific camera.
+     */
+    fun getEventRecorder(cameraId: String, config: CameraConfigEntity? = null): EventRecorder {
+        return eventRecorders.getOrPut(cameraId) {
+            EventRecorder(
+                context = context,
+                cameraId = cameraId,
+                preBufferSeconds = 5,
+                postBufferSeconds = 3
+            ).apply { start() }
+        }
+    }
+
+    /**
+     * Save a high-quality JPEG snapshot when an object is detected.
+     * This is the primary snapshot path used by the DetectionPipeline.
      */
     fun saveEventSnapshot(cameraId: String, label: String, bitmap: Bitmap): File? {
-        val filename = "${cameraId}_${label}_${System.currentTimeMillis()}.jpg"
+        val timestamp = System.currentTimeMillis()
+        val filename = "${cameraId}_${label}_${timestamp}.jpg"
         val destFile = File(baseRecordingsDir, filename)
 
         var fos: FileOutputStream? = null
@@ -36,10 +61,10 @@ class ClipRecorder(
             fos = FileOutputStream(destFile)
             bitmap.compress(Bitmap.CompressFormat.JPEG, 90, fos)
             fos.flush()
-            Log.d(tag, "Saved event snapshot on disk: ${destFile.absolutePath}")
+            Log.d(tag, "Snapshot saved: ${destFile.absolutePath} (${destFile.length() / 1024}KB)")
             destFile
         } catch (e: IOException) {
-            Log.e(tag, "Failed to save event snapshot to disk", e)
+            Log.e(tag, "Failed to save snapshot", e)
             null
         } finally {
             fos?.close()
@@ -47,63 +72,87 @@ class ClipRecorder(
     }
 
     /**
-     * Enforces video retention schedules, purging obsolete files and cleaning up Room database items.
+     * Enforce retention schedules, purging obsolete files and database entries.
      */
     suspend fun enforceRetentionPolicy(camera: CameraConfigEntity) {
         try {
             val expirationLimitMs = System.currentTimeMillis() - (camera.recordingRetentionDays * 24 * 60 * 60 * 1000).toLong()
-            
-            // Delete historical files from disk that exceed limit
-            val filePrefix = "${camera.id}_"
-            val files = baseRecordingsDir.listFiles { _, name -> name.startsWith(filePrefix) } ?: emptyArray()
+
+            // Delete files older than retention limit
+            val files = baseRecordingsDir.listFiles { _, name ->
+                name.startsWith(camera.id)
+            } ?: emptyArray()
 
             var countPurged = 0
             for (file in files) {
-                // Parse timestamp out of standard naming structure e.g., camera_label_timestamp.jpg
-                val nameParts = file.nameWithoutExtension.split("_")
-                if (nameParts.size >= 3) {
-                    val timestampStr = nameParts[2]
-                    val timestamp = timestampStr.toLongOrNull()
-                    if (timestamp != null && timestamp < expirationLimitMs) {
-                        if (file.delete()) {
-                            countPurged++
-                        }
-                    }
+                if (file.lastModified() < expirationLimitMs) {
+                    if (file.delete()) countPurged++
                 }
             }
 
-            // Sync database listings
+            // Also purge via EventRecorder
+            eventRecorders[camera.id]?.enforceRetention(camera.recordingRetentionDays)
+
+            // Sync database
             nvrDao.deleteEventsOlderThan(expirationLimitMs)
-            
+
             if (countPurged > 0) {
-                Log.i(tag, "Cleaned up $countPurged expired recording file(s) for camera: ${camera.name}")
+                Log.i(tag, "Retention: purged $countPurged file(s) for camera: ${camera.name}")
             }
         } catch (e: Exception) {
-            Log.e(tag, "Error performing file retention sweep", e)
+            Log.e(tag, "Retention policy error", e)
         }
     }
 
     /**
-     * Simulates MP4 clip recording initialization (using MediaMuxer).
+     * Feed a decoded frame into the active EventRecorder for pre-buffer.
+     * Called continuously by the stream ingester.
      */
-    fun recordEventClip(cameraId: String, durationSecs: Int): File? {
-        val destFile = File(baseRecordingsDir, "${cameraId}_clip_${System.currentTimeMillis()}.mp4")
-        
-        try {
-            // Setup MediaMuxer container for writing standard MP4 containers
-            val muxer = MediaMuxer(destFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            
-            // In a real device, the NVR service writes encoded video frames from MediaCodec.
-            // We simulate a basic configuration structure and start/stop the muxer container:
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 640, 360)
-            // Add mock tracks and start
-            Log.d(tag, "Created event clip container: ${destFile.absolutePath}")
-            
-            // We return the file placeholder representing the saved clip
-            return destFile
-        } catch (e: Exception) {
-            Log.e(tag, "Failed to initialize MediaMuxer recording clip", e)
-            return null
+    fun feedFrameForPreBuffer(cameraId: String, bitmap: Bitmap) {
+        eventRecorders[cameraId]?.feedFrame(bitmap)
+    }
+
+    /**
+     * Trigger event recording (snapshot + clip with pre/post buffer).
+     * Called by DetectionPipeline when an object is detected.
+     */
+    fun triggerEventRecording(
+        cameraId: String,
+        eventType: String,
+        confidence: Float,
+        currentFrame: Bitmap
+    ): Pair<String?, String?> {
+        val recorder = eventRecorders[cameraId]
+        return if (recorder != null) {
+            recorder.triggerEvent(eventType, confidence, currentFrame)
+        } else {
+            Pair(saveEventSnapshot(cameraId, eventType, currentFrame)?.absolutePath, null)
         }
+    }
+
+    /**
+     * Stop active event recording and finalize clip.
+     */
+    fun stopEventRecording(cameraId: String): EventRecorder.RecordingMetadata? {
+        return eventRecorders[cameraId]?.stopEvent()
+    }
+
+    /**
+     * Start all event recorders for active cameras.
+     */
+    fun startAll(cameras: List<CameraConfigEntity>) {
+        for (camera in cameras) {
+            getEventRecorder(camera.id, camera)
+        }
+    }
+
+    /**
+     * Stop all recorders and clean up.
+     */
+    fun stopAll() {
+        for ((cameraId, recorder) in eventRecorders) {
+            recorder.stop()
+        }
+        eventRecorders.clear()
     }
 }
