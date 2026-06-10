@@ -113,15 +113,20 @@ class ObjectDetector(
                 }
             }
 
-            // 4. Build the Task Vision ObjectDetector with default acceleration
-            //    The Task Library auto-selects XNNPACK CPU backend by default,
-            //    which provides SIMD-optimized inference on all modern ARM CPUs.
-            val options = TfLiteObjectDetector.ObjectDetectorOptions.builder()
+            // 4. Build the Task Vision ObjectDetector with hardware acceleration
+            val optionsBuilder = TfLiteObjectDetector.ObjectDetectorOptions.builder()
                 .setScoreThreshold(detectionThreshold)
                 .setMaxResults(maxResults)
-                .build()
 
-            detector = TfLiteObjectDetector.createFromFileAndOptions(context, modelFilename, options)
+            val baseOptionsBuilder = BaseOptions.builder()
+            if (gpuOk) {
+                baseOptionsBuilder.useGpu()
+            } else if (nnapiOk) {
+                baseOptionsBuilder.useNnapi()
+            }
+            optionsBuilder.setBaseOptions(baseOptionsBuilder.build())
+
+            detector = TfLiteObjectDetector.createFromFileAndOptions(context, modelFilename, optionsBuilder.build())
 
             Log.i(tag, "✅ ObjectDetector ready | Backend: $activeDelegate | Model: $modelFilename")
             true
