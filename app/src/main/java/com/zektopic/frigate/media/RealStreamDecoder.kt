@@ -116,13 +116,8 @@ class RealStreamDecoder(
      * would be used. This implementation provides a software-based fallback.
      */
     private fun decodeRtspStream() {
-        Log.d(tag, "RTSP stream detected. Attempting TCP transport for: $streamUrl")
-        onError?.invoke("RTSP direct decode not fully supported on Android MediaCodec. Use HTTP/RSTP relay or HLS.")
-
-        // Fallback: attempt to parse the stream as generic MPEG-TS over TCP
-        // For real deployment, use ExoPlayer RTSP module for UI + this decoder
-        // for AI frame extraction via a separate codec instance.
-        tryDecodeGenericUrl(streamUrl)
+        Log.w(tag, "RTSP stream detected. Direct decode not fully supported on on-device MediaCodec.")
+        onError?.invoke("RTSP direct decode not supported. Use HLS/HTTP relay for background processing.")
     }
 
     /**

@@ -302,35 +302,8 @@ class EventRecorder(
 
                 encoder.start()
 
-                // Get track index once encoder produces output format
-                val bufferInfo = MediaCodec.BufferInfo()
-                var gotTrack = false
-                val timeoutLoop = 10
-
-                for (i in 0 until timeoutLoop) {
-                    val outputIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
-                    when {
-                        outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            val newFormat = encoder.outputFormat
-                            videoTrackIndex = muxer.addTrack(newFormat)
-                            muxer.start()
-                            muxerStarted = true
-                            gotTrack = true
-                            encoder.releaseOutputBuffer(outputIndex, false)
-                            break
-                        }
-                        outputIndex >= 0 -> {
-                            encoder.releaseOutputBuffer(outputIndex, false)
-                        }
-                    }
-                }
-
-                if (!gotTrack) {
-                    Log.w(tag, "Encoder didn't produce output format in expected time")
-                }
-
                 Log.i(tag, "Event recording initialized: ${file.name} " +
-                        "(${width}x${height} @ ${framerate}fps, ${bitrate / 1000}kbps)")
+                        "(${width}x${height} @ ${framerate}fps, ${bitrate / 1000}kbps). Muxer will start dynamically on first frame output.")
                 true
 
             } catch (e: Exception) {
@@ -399,7 +372,6 @@ class EventRecorder(
         private fun drainEncoder() {
             val codec = mediaCodec ?: return
             val muxer = mediaMuxer ?: return
-            if (!muxerStarted) return
 
             val bufferInfo = MediaCodec.BufferInfo()
             var drained = true
@@ -411,13 +383,21 @@ class EventRecorder(
                         drained = false
                     }
                     outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        // Track added already, ignore subsequent format changes
+                        if (!muxerStarted) {
+                            val newFormat = codec.outputFormat
+                            videoTrackIndex = muxer.addTrack(newFormat)
+                            muxer.start()
+                            muxerStarted = true
+                            Log.i(tag, "MediaMuxer started dynamically with format: $newFormat")
+                        }
                     }
                     outputIndex >= 0 -> {
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-                            val outputBuffer = codec.getOutputBuffer(outputIndex)
-                            if (outputBuffer != null) {
-                                muxer.writeSampleData(videoTrackIndex, outputBuffer, bufferInfo)
+                        if (muxerStarted) {
+                            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                                val outputBuffer = codec.getOutputBuffer(outputIndex)
+                                if (outputBuffer != null) {
+                                    muxer.writeSampleData(videoTrackIndex, outputBuffer, bufferInfo)
+                                }
                             }
                         }
                         codec.releaseOutputBuffer(outputIndex, false)
