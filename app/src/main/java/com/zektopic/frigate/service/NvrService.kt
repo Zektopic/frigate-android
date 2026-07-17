@@ -67,6 +67,14 @@ class NvrService : Service(), LifecycleOwner {
     private val cameraById = java.util.concurrent.ConcurrentHashMap<String, CameraConfigEntity>()
     private val activeEventIdByCamera = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
+    // Live per-camera feature toggles (detect/record/snapshots), parsed from the
+    // persisted YAML so the tile switches genuinely gate downstream behavior.
+    @Volatile private var cameraFeatures: Map<String, com.zektopic.frigate.ui.settings.CameraFeatures> = emptyMap()
+
+    // Notification preferences, cached from DataStore so alert gating is enforced.
+    private lateinit var appPreferences: com.zektopic.frigate.data.AppPreferences
+    @Volatile private var notificationSettings = com.zektopic.frigate.data.NotificationSettings()
+
     @Inject
     lateinit var nvrDao: NvrDao
 
@@ -75,6 +83,22 @@ class NvrService : Service(), LifecycleOwner {
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
 
         clipRecorder = com.zektopic.frigate.media.ClipRecorder(this, nvrDao)
+
+        // Cache notification preferences so alert gating is enforced at post time
+        appPreferences = com.zektopic.frigate.data.AppPreferences(applicationContext)
+        serviceScope.launch {
+            appPreferences.notificationSettings.collect { notificationSettings = it }
+        }
+
+        // Cache per-camera live feature toggles parsed from the persisted YAML
+        serviceScope.launch {
+            nvrDao.getSystemConfigFlow().collect { config ->
+                cameraFeatures = config?.configYaml?.let {
+                    try { com.zektopic.frigate.ui.settings.CameraYamlEditor.readAllCameraFeatures(it) }
+                    catch (e: Exception) { emptyMap() }
+                } ?: emptyMap()
+            }
+        }
 
         // Periodically finalize idle recordings and attach the clip to its event
         serviceScope.launch {
@@ -246,15 +270,22 @@ class NvrService : Service(), LifecycleOwner {
     private suspend fun processIncomingFrame(cameraId: String, bitmap: android.graphics.Bitmap) {
         val motionDetector = motionDetectors[cameraId] ?: return
 
+        // Per-camera live toggles (default all-on when a camera has no flags yet)
+        val features = cameraFeatures[cameraId] ?: com.zektopic.frigate.ui.settings.CameraFeatures()
+
         // 1. Run low-power motion detection pre-filter
         val hasMotion = motionDetector.detectMotion(bitmap)
         if (!hasMotion) return
 
         // 2. Open (or extend) a motion-triggered clip recording for this camera
+        //    — gated by the camera's Record toggle
         val camera = cameraById[cameraId]
-        if (camera != null) {
+        if (camera != null && features.record) {
             clipRecorder.onMotion(camera, bitmap)
         }
+
+        // Detect toggle off → no events or alerts (recording above is independent)
+        if (!features.detect) return
 
         // 3. Throttle event logging to once every 10 seconds per camera
         val currentTime = System.currentTimeMillis()
@@ -262,8 +293,10 @@ class NvrService : Service(), LifecycleOwner {
         if (currentTime - lastTime >= 10000L) {
             lastEventTime[cameraId] = currentTime
 
-            // Save a snapshot for the event thumbnail
-            val snapshotPath = clipRecorder.saveEventSnapshot(cameraId, "motion", bitmap)?.absolutePath
+            // Save a snapshot for the event thumbnail — gated by the Snapshots toggle
+            val snapshotPath = if (features.snapshots)
+                clipRecorder.saveEventSnapshot(cameraId, "motion", bitmap)?.absolutePath
+            else null
 
             // Insert event; videoPath is attached when the clip finalizes (see reap loop)
             val eventId = nvrDao.insertEvent(
@@ -285,8 +318,11 @@ class NvrService : Service(), LifecycleOwner {
     }
 
     private fun triggerSystemAlert(cameraId: String, label: String, confidence: Float) {
+        // Respect the user's notification preferences (global + per-camera mute)
+        if (!notificationSettings.shouldNotify(cameraId)) return
+
         val notificationManager = androidx.core.app.NotificationManagerCompat.from(this)
-        
+
         // Validate runtime permissions
         if (android.os.Build.VERSION.SDK_INT >= 33) {
             val permissionState = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)

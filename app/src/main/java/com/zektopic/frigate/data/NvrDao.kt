@@ -35,6 +35,9 @@ interface NvrDao {
     @Query("DELETE FROM nvr_events WHERE timestamp < :expirationTimestamp")
     suspend fun deleteEventsOlderThan(expirationTimestamp: Long)
 
+    @Query("DELETE FROM nvr_events")
+    suspend fun deleteAllEvents()
+
     @Query("UPDATE nvr_events SET videoPath = :videoPath WHERE id = :eventId")
     suspend fun updateEventVideoPath(eventId: Long, videoPath: String)
 

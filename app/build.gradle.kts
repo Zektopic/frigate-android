@@ -110,6 +110,9 @@ dependencies {
     // YAML parsing
     implementation("org.yaml:snakeyaml:2.2")
 
+    // DataStore for app preferences (notifications, etc.)
+    implementation("androidx.datastore:datastore-preferences:1.0.0")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     testImplementation("androidx.media3:media3-container:$media3Version")

@@ -45,6 +45,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.EventEntity
 import com.zektopic.frigate.media.StreamState
+import com.zektopic.frigate.ui.settings.CameraFeatures
+import com.zektopic.frigate.ui.settings.CameraYamlEditor
 import com.zektopic.frigate.ui.theme.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -62,9 +64,26 @@ fun DashboardScreen(
     onTriggerTestNotification: () -> Unit,
     onStartNvrService: () -> Unit,
     onStopNvrService: () -> Unit,
+    onClearAllRecordings: suspend () -> Unit,
     isServiceRunning: Boolean
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
+    val settingsScope = rememberCoroutineScope()
+
+    // Per-camera live feature flags, parsed once from the persisted YAML. The tile
+    // toggles read these and write back through onSaveConfig (YAML = source of truth).
+    val persistedConfigYaml = systemConfig?.configYaml ?: ""
+    val cameraFeatures = remember(persistedConfigYaml) {
+        CameraYamlEditor.readAllCameraFeatures(persistedConfigYaml)
+    }
+    val onToggleFeature: (String, CameraYamlEditor.Feature, Boolean) -> Unit =
+        { cameraId, feature, enabled ->
+            settingsScope.launch {
+                try {
+                    onSaveConfig(CameraYamlEditor.setCameraFeature(persistedConfigYaml, cameraId, feature, enabled))
+                } catch (_: Exception) { /* surfaced via config reload */ }
+            }
+        }
 
     // Real app CPU usage: delta of process CPU time over wall time, normalized per core
     var currentCpuUsage by remember { mutableIntStateOf(0) }
@@ -103,7 +122,9 @@ fun DashboardScreen(
                 onStart = onStartNvrService,
                 onStop = onStopNvrService,
                 onAddMockCamera = onAddMockCamera,
-                currentCpu = currentCpuUsage
+                currentCpu = currentCpuUsage,
+                cameraFeatures = cameraFeatures,
+                onToggleFeature = onToggleFeature
             )
             1 -> RecordingsScreen(
                 events = events
@@ -117,7 +138,9 @@ fun DashboardScreen(
             3 -> ConfigScreen(
                 systemConfig = systemConfig,
                 cameraConfigs = cameraConfigs,
-                onSaveConfig = onSaveConfig
+                events = events,
+                onSaveConfig = onSaveConfig,
+                onClearAllRecordings = onClearAllRecordings
             )
         }
     }
@@ -294,7 +317,9 @@ fun LiveDashboardScreen(
     onStart: () -> Unit,
     onStop: () -> Unit,
     onAddMockCamera: () -> Unit,
-    currentCpu: Int
+    currentCpu: Int,
+    cameraFeatures: Map<String, CameraFeatures> = emptyMap(),
+    onToggleFeature: (String, CameraYamlEditor.Feature, Boolean) -> Unit = { _, _, _ -> }
 ) {
     // Frigate's Live view groups: "All Cameras" grid or the composite Birdseye view
     var selectedGroup by remember { mutableIntStateOf(0) }
@@ -356,6 +381,8 @@ fun LiveDashboardScreen(
                         latestFrame = latestFrames[camera.id],
                         streamState = streamStates[camera.id],
                         isServiceRunning = isServiceRunning,
+                        features = cameraFeatures[camera.id] ?: CameraFeatures(),
+                        onToggleFeature = { feature, enabled -> onToggleFeature(camera.id, feature, enabled) },
                         onClick = { fullscreenCameraId = camera.id }
                     )
                 }
@@ -568,12 +595,14 @@ fun CameraLiveFeedCard(
     latestFrame: Bitmap?,
     streamState: StreamState?,
     isServiceRunning: Boolean,
+    features: CameraFeatures = CameraFeatures(),
+    onToggleFeature: (CameraYamlEditor.Feature, Boolean) -> Unit = { _, _ -> },
     onClick: () -> Unit = {}
 ) {
-    // Settings switches state representing Frigate toggles
-    var isDetectEnabled by remember { mutableStateOf(camera.isEnabled) }
-    var isRecordEnabled by remember { mutableStateOf(true) }
-    var isSnapshotsEnabled by remember { mutableStateOf(true) }
+    // Real, persisted per-camera toggles (backed by the camera YAML, consumed by the service)
+    val isDetectEnabled = features.detect
+    val isRecordEnabled = features.record
+    val isSnapshotsEnabled = features.snapshots
 
     val effectiveState = if (isServiceRunning) streamState else null
 
@@ -751,9 +780,9 @@ fun CameraLiveFeedCard(
                     .padding(12.dp),
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
-                ToggleButton(label = "Detect", active = isDetectEnabled, onToggle = { isDetectEnabled = !isDetectEnabled }, activeColor = StatusGreen)
-                ToggleButton(label = "Record", active = isRecordEnabled, onToggle = { isRecordEnabled = !isRecordEnabled }, activeColor = FrigateBlue)
-                ToggleButton(label = "Snapshots", active = isSnapshotsEnabled, onToggle = { isSnapshotsEnabled = !isSnapshotsEnabled }, activeColor = StatusAmber)
+                ToggleButton(label = "Detect", active = isDetectEnabled, onToggle = { onToggleFeature(CameraYamlEditor.Feature.DETECT, !isDetectEnabled) }, activeColor = StatusGreen)
+                ToggleButton(label = "Record", active = isRecordEnabled, onToggle = { onToggleFeature(CameraYamlEditor.Feature.RECORD, !isRecordEnabled) }, activeColor = FrigateBlue)
+                ToggleButton(label = "Snapshots", active = isSnapshotsEnabled, onToggle = { onToggleFeature(CameraYamlEditor.Feature.SNAPSHOTS, !isSnapshotsEnabled) }, activeColor = StatusAmber)
             }
         }
     }
@@ -1410,7 +1439,9 @@ fun GaugeIndicator(label: String, value: Float, color: Color) {
 fun ConfigScreen(
     systemConfig: com.zektopic.frigate.data.SystemConfigEntity?,
     cameraConfigs: List<CameraConfigEntity>,
-    onSaveConfig: suspend (String) -> Unit
+    events: List<EventEntity>,
+    onSaveConfig: suspend (String) -> Unit,
+    onClearAllRecordings: suspend () -> Unit
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -1564,6 +1595,21 @@ fun ConfigScreen(
                 }
             }
         }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // ── Global configuration, notifications, storage, about ─────────
+        com.zektopic.frigate.ui.settings.GlobalConfigSection(
+            currentYaml = persistedYaml,
+            onSave = onSaveConfig
+        )
+        com.zektopic.frigate.ui.settings.NotificationsSection(cameraConfigs = cameraConfigs)
+        com.zektopic.frigate.ui.settings.StorageSection(onClearAllRecordings = onClearAllRecordings)
+        com.zektopic.frigate.ui.settings.AboutSection(
+            cameraConfigs = cameraConfigs,
+            events = events,
+            configYaml = persistedYaml
+        )
 
         Spacer(modifier = Modifier.height(4.dp))
 

@@ -155,6 +155,10 @@ class MainActivity : ComponentActivity() {
                     onStopNvrService = {
                         stopNvrService()
                     },
+                    onClearAllRecordings = {
+                        // Files are deleted by the Storage section; clear the event log too
+                        nvrDao.deleteAllEvents()
+                    },
                     isServiceRunning = isServiceRunning
                 )
             }

@@ -106,7 +106,109 @@ object CameraYamlEditor {
         root["cameras"] = cameras
         return yaml().dump(root)
     }
+
+    /** Per-camera feature flag toggled from the live tiles. */
+    enum class Feature(val block: String) { DETECT("detect"), RECORD("record"), SNAPSHOTS("snapshots") }
+
+    private fun asBool(value: Any?, default: Boolean): Boolean = when (value) {
+        is Boolean -> value
+        is String -> value.equals("true", ignoreCase = true)
+        else -> default
+    }
+
+    /**
+     * Read the detect/record/snapshots enabled flags for every camera in the
+     * config. Absent flags default to true (the app's historical behavior), so
+     * existing configs keep recording and snapshots on.
+     */
+    @Suppress("UNCHECKED_CAST")
+    fun readAllCameraFeatures(yamlText: String): Map<String, CameraFeatures> {
+        val root = try { loadRoot(yamlText) } catch (e: Exception) { return emptyMap() }
+        val cameras = root["cameras"] as? Map<String, Any> ?: return emptyMap()
+        val result = LinkedHashMap<String, CameraFeatures>()
+        for ((id, raw) in cameras) {
+            val cam = raw as? Map<String, Any> ?: continue
+            fun blockEnabled(name: String): Boolean {
+                val block = cam[name] as? Map<String, Any> ?: return true
+                return asBool(block["enabled"], true)
+            }
+            result[id] = CameraFeatures(
+                detect = blockEnabled("detect"),
+                record = blockEnabled("record"),
+                snapshots = blockEnabled("snapshots")
+            )
+        }
+        return result
+    }
+
+    /** Set `cameras.<id>.<block>.enabled` and return the updated YAML. */
+    @Suppress("UNCHECKED_CAST")
+    fun setCameraFeature(yamlText: String, cameraId: String, feature: Feature, enabled: Boolean): String {
+        val root = loadRoot(yamlText)
+        val cameras = (root["cameras"] as? MutableMap<String, Any>) ?: return yamlText
+        val cam = (cameras[cameraId] as? MutableMap<String, Any>) ?: return yamlText
+        val block = (cam[feature.block] as? MutableMap<String, Any>) ?: linkedMapOf()
+        block["enabled"] = enabled
+        cam[feature.block] = block
+        cameras[cameraId] = cam
+        root["cameras"] = cameras
+        return yaml().dump(root)
+    }
+
+    /** Read the top-level MQTT / detection / tracked-object globals. */
+    @Suppress("UNCHECKED_CAST")
+    fun readGlobals(yamlText: String): GlobalConfigDraft {
+        val root = try { loadRoot(yamlText) } catch (e: Exception) { return GlobalConfigDraft() }
+        val mqtt = root["mqtt"] as? Map<String, Any>
+        val detect = root["detect"] as? Map<String, Any>
+        val objects = root["objects"] as? Map<String, Any>
+        val track = (objects?.get("track") as? List<*>)?.mapNotNull { it?.toString() } ?: emptyList()
+        val default = GlobalConfigDraft()
+        return GlobalConfigDraft(
+            mqttHost = (mqtt?.get("host") as? String) ?: "",
+            mqttPort = (mqtt?.get("port") as? Number)?.toInt() ?: default.mqttPort,
+            detectWidth = (detect?.get("width") as? Number)?.toInt() ?: default.detectWidth,
+            detectHeight = (detect?.get("height") as? Number)?.toInt() ?: default.detectHeight,
+            detectFps = (detect?.get("fps") as? Number)?.toInt() ?: default.detectFps,
+            trackedObjects = track.ifEmpty { default.trackedObjects }
+        )
+    }
+
+    /** Insert or replace the top-level `mqtt`, `detect`, and `objects.track` blocks. */
+    @Suppress("UNCHECKED_CAST")
+    fun upsertGlobals(yamlText: String, draft: GlobalConfigDraft): String {
+        val root = loadRoot(yamlText)
+        if (draft.mqttHost.isNotBlank()) {
+            root["mqtt"] = linkedMapOf<String, Any>("host" to draft.mqttHost.trim(), "port" to draft.mqttPort)
+        } else {
+            root.remove("mqtt")
+        }
+        root["detect"] = linkedMapOf<String, Any>(
+            "width" to draft.detectWidth,
+            "height" to draft.detectHeight,
+            "fps" to draft.detectFps
+        )
+        root["objects"] = linkedMapOf<String, Any>("track" to draft.trackedObjects)
+        return yaml().dump(root)
+    }
 }
+
+/** Snapshot of a camera's live feature toggles, consumed by the NVR service. */
+data class CameraFeatures(
+    val detect: Boolean = true,
+    val record: Boolean = true,
+    val snapshots: Boolean = true
+)
+
+/** Top-level (non per-camera) configuration edited in the global settings form. */
+data class GlobalConfigDraft(
+    val mqttHost: String = "",
+    val mqttPort: Int = 1883,
+    val detectWidth: Int = 640,
+    val detectHeight: Int = 360,
+    val detectFps: Int = 5,
+    val trackedObjects: List<String> = listOf("person", "car", "bird")
+)
 
 // ---------------------------------------------------------------------------
 // RTSP connection test
