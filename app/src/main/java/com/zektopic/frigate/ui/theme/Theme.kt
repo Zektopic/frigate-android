@@ -9,14 +9,14 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 
 private val DarkColorScheme = darkColorScheme(
-    primary = CyberCyan,
-    secondary = ElectricEmerald,
-    tertiary = HotPink,
-    background = DarkVoid,
-    surface = CardCarbon,
-    onBackground = LightWhite,
-    onSurface = LightWhite,
-    onPrimary = DarkVoid,
+    primary = FrigateBlue,
+    secondary = StatusGreen,
+    tertiary = StatusRed,
+    background = SlateBg,
+    surface = SlateCard,
+    onBackground = TextPrimary,
+    onSurface = TextPrimary,
+    onPrimary = TextPrimary,
     outline = SlateBorder
 )
 
@@ -30,8 +30,8 @@ fun FrigateAndroidTheme(
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
-            window.statusBarColor = DarkVoid.toArgb()
-            window.navigationBarColor = DarkVoid.toArgb()
+            window.statusBarColor = SlateBg.toArgb()
+            window.navigationBarColor = SlateBg.toArgb()
         }
     }
 

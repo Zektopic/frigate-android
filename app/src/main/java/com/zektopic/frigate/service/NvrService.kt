@@ -16,12 +16,16 @@ import com.zektopic.frigate.MainActivity
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
 import com.zektopic.frigate.media.StreamIngester
+import com.zektopic.frigate.media.StreamState
 import dagger.hilt.android.AndroidEntryPoint
 import android.graphics.Bitmap
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.update
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -47,6 +51,10 @@ class NvrService : Service(), LifecycleOwner {
     )
     val frameFlow = _frameFlow.asSharedFlow()
 
+    // Per-camera connection state (Frigate-style: connecting/live/retrying/offline)
+    private val _streamStates = MutableStateFlow<Map<String, StreamState>>(emptyMap())
+    val streamStates = _streamStates.asStateFlow()
+
     fun getLatestFrame(cameraId: String): Bitmap? {
         return latestFramesMap[cameraId]
     }
@@ -54,13 +62,34 @@ class NvrService : Service(), LifecycleOwner {
     // Embedded Ktor Web Server
     private var webServer: com.zektopic.frigate.server.EmbeddedWebServer? = null
 
+    // Motion-triggered clip recording
+    private lateinit var clipRecorder: com.zektopic.frigate.media.ClipRecorder
+    private val cameraById = java.util.concurrent.ConcurrentHashMap<String, CameraConfigEntity>()
+    private val activeEventIdByCamera = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
     @Inject
     lateinit var nvrDao: NvrDao
 
     override fun onCreate() {
         super.onCreate()
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
-        
+
+        clipRecorder = com.zektopic.frigate.media.ClipRecorder(this, nvrDao)
+
+        // Periodically finalize idle recordings and attach the clip to its event
+        serviceScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(2000)
+                for ((cameraId, path) in clipRecorder.reapIdleSessions()) {
+                    activeEventIdByCamera.remove(cameraId)?.let { eventId ->
+                        try { nvrDao.updateEventVideoPath(eventId, path) } catch (e: Exception) {
+                            Log.e(tag, "Failed to attach clip to event", e)
+                        }
+                    }
+                }
+            }
+        }
+
         // Initialize and start embedded Ktor web server
         webServer = com.zektopic.frigate.server.EmbeddedWebServer(this, nvrDao)
         webServer?.start()
@@ -98,6 +127,7 @@ class NvrService : Service(), LifecycleOwner {
                                 }
                                 activeIngesters.clear()
                                 motionDetectors.clear()
+                                _streamStates.value = emptyMap()
                             }
                         } else {
                             updateNotification("Monitoring ${activeCameras.size} active camera stream(s)")
@@ -123,8 +153,12 @@ class NvrService : Service(), LifecycleOwner {
 
     override fun onDestroy() {
         Log.i(tag, "NVR Foreground Service destroying...")
+
+        // Finalize any in-progress recordings before tearing down
+        try { clipRecorder.stopAll() } catch (e: Exception) { Log.e(tag, "Error stopping recordings", e) }
+
         serviceScope.cancel()
-        
+
         // Safely stop all stream ingesters
         synchronized(activeIngesters) {
             for ((cameraId, ingester) in activeIngesters) {
@@ -170,22 +204,35 @@ class NvrService : Service(), LifecycleOwner {
             }
             activeIngesters.clear()
             motionDetectors.clear()
+            cameraById.clear()
+            _streamStates.value = emptyMap()
 
             // Initialize new ingesters
             for (camera in cameras) {
                 // Initialize a motion detector for this camera with specific thresholds
                 motionDetectors[camera.id] = com.zektopic.frigate.ai.MotionDetector(camera.motionThreshold)
+                cameraById[camera.id] = camera
 
-                val ingester = StreamIngester(this, camera) { frameBitmap ->
-                    // Cache frame and emit for Compose/Ktor clients
-                    latestFramesMap[camera.id] = frameBitmap
-                    _frameFlow.tryEmit(Pair(camera.id, frameBitmap))
+                val ingester = StreamIngester(
+                    this,
+                    camera,
+                    onFrameExtracted = { frameBitmap ->
+                        // Cache frame and emit for Compose/Ktor clients
+                        latestFramesMap[camera.id] = frameBitmap
+                        _frameFlow.tryEmit(Pair(camera.id, frameBitmap))
 
-                    // Route frame through the gated AI pipeline in a background thread
-                    serviceScope.launch(Dispatchers.Default) {
-                        processIncomingFrame(camera.id, frameBitmap)
+                        // Feed any in-progress motion recording for this camera
+                        clipRecorder.offerFrame(camera.id, frameBitmap)
+
+                        // Route frame through the gated AI pipeline in a background thread
+                        serviceScope.launch(Dispatchers.Default) {
+                            processIncomingFrame(camera.id, frameBitmap)
+                        }
+                    },
+                    onStateChanged = { state ->
+                        _streamStates.update { it + (camera.id to state) }
                     }
-                }
+                )
                 activeIngesters[camera.id] = ingester
                 ingester.start()
             }
@@ -198,29 +245,39 @@ class NvrService : Service(), LifecycleOwner {
 
     private suspend fun processIncomingFrame(cameraId: String, bitmap: android.graphics.Bitmap) {
         val motionDetector = motionDetectors[cameraId] ?: return
-        
+
         // 1. Run low-power motion detection pre-filter
         val hasMotion = motionDetector.detectMotion(bitmap)
         if (!hasMotion) return
 
-        // 2. Throttle event logging to once every 10 seconds per camera
+        // 2. Open (or extend) a motion-triggered clip recording for this camera
+        val camera = cameraById[cameraId]
+        if (camera != null) {
+            clipRecorder.onMotion(camera, bitmap)
+        }
+
+        // 3. Throttle event logging to once every 10 seconds per camera
         val currentTime = System.currentTimeMillis()
         val lastTime = lastEventTime[cameraId] ?: 0L
         if (currentTime - lastTime >= 10000L) {
             lastEventTime[cameraId] = currentTime
-            
-            // Insert event into local database
-            nvrDao.insertEvent(
+
+            // Save a snapshot for the event thumbnail
+            val snapshotPath = clipRecorder.saveEventSnapshot(cameraId, "motion", bitmap)?.absolutePath
+
+            // Insert event; videoPath is attached when the clip finalizes (see reap loop)
+            val eventId = nvrDao.insertEvent(
                 com.zektopic.frigate.data.EventEntity(
                     cameraId = cameraId,
                     label = "motion",
                     confidence = 1.0f,
                     timestamp = currentTime,
-                    snapshotPath = null,
-                    videoPath = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+                    snapshotPath = snapshotPath,
+                    videoPath = null,
                     zone = "Main Zone"
                 )
             )
+            activeEventIdByCamera[cameraId] = eventId
 
             // Trigger system alerts for motion detection
             triggerSystemAlert(cameraId, "motion", 1.0f)

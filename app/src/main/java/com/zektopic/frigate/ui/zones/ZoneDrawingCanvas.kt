@@ -21,10 +21,10 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.zektopic.frigate.ui.theme.CyberCyan
-import com.zektopic.frigate.ui.theme.DarkVoid
-import com.zektopic.frigate.ui.theme.ElectricEmerald
-import com.zektopic.frigate.ui.theme.HotPink
+import com.zektopic.frigate.ui.theme.FrigateBlue
+import com.zektopic.frigate.ui.theme.SlateBg
+import com.zektopic.frigate.ui.theme.StatusGreen
+import com.zektopic.frigate.ui.theme.StatusRed
 
 @Composable
 fun ZoneDrawingCanvas(
@@ -36,7 +36,7 @@ fun ZoneDrawingCanvas(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkVoid.copy(alpha = 0.95f))
+            .background(SlateBg.copy(alpha = 0.95f))
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
@@ -63,9 +63,9 @@ fun ZoneDrawingCanvas(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 IconButton(
                     onClick = { points.clear() },
-                    colors = IconButtonDefaults.iconButtonColors(containerColor = HotPink.copy(alpha = 0.15f))
+                    colors = IconButtonDefaults.iconButtonColors(containerColor = StatusRed.copy(alpha = 0.15f))
                 ) {
-                    Icon(imageVector = Icons.Default.Delete, contentDescription = "Clear", tint = HotPink)
+                    Icon(imageVector = Icons.Default.Delete, contentDescription = "Clear", tint = StatusRed)
                 }
 
                 IconButton(
@@ -77,13 +77,13 @@ fun ZoneDrawingCanvas(
                     },
                     enabled = points.size >= 3,
                     colors = IconButtonDefaults.iconButtonColors(
-                        containerColor = if (points.size >= 3) ElectricEmerald.copy(alpha = 0.15f) else Color.DarkGray
+                        containerColor = if (points.size >= 3) StatusGreen.copy(alpha = 0.15f) else Color.DarkGray
                     )
                 ) {
                     Icon(
                         imageVector = Icons.Default.Check,
                         contentDescription = "Save",
-                        tint = if (points.size >= 3) ElectricEmerald else Color.Gray
+                        tint = if (points.size >= 3) StatusGreen else Color.Gray
                     )
                 }
             }
@@ -106,7 +106,7 @@ fun ZoneDrawingCanvas(
                     // Draw Vertices
                     for (point in points) {
                         drawCircle(
-                            color = CyberCyan,
+                            color = FrigateBlue,
                             radius = 8.dp.toPx(),
                             center = point
                         )
@@ -125,7 +125,7 @@ fun ZoneDrawingCanvas(
 
                     drawPath(
                         path = path,
-                        color = CyberCyan,
+                        color = FrigateBlue,
                         style = Stroke(width = 3.dp.toPx())
                     )
 
@@ -133,7 +133,7 @@ fun ZoneDrawingCanvas(
                     if (points.size >= 3) {
                         drawPath(
                             path = path,
-                            color = CyberCyan.copy(alpha = 0.1f)
+                            color = FrigateBlue.copy(alpha = 0.1f)
                         )
                     }
                 }

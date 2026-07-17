@@ -26,3 +26,11 @@ Thumbs.db
 
 # Local test binary dumps
 *.bin
+
+# Debug/dev artifacts
+logcat*.txt
+screencap*.png
+*.sqlite
+db.sqlite
+frigate_nvr_database
+/scratch/

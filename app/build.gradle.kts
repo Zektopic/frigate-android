@@ -83,6 +83,8 @@ dependencies {
     implementation("androidx.camera:camera-view:$cameraVersion")
 
     // Jetpack Media3 ExoPlayer for robust RTSP decoding
+    // Pinned to 1.3.1: RTSP H.265 streams never reach STATE_READY on 1.4.1
+    // with these cameras (verified on-device 2026-07-17)
     val media3Version = "1.3.1"
     implementation("androidx.media3:media3-exoplayer:$media3Version")
     implementation("androidx.media3:media3-exoplayer-rtsp:$media3Version")
@@ -110,6 +112,7 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("androidx.media3:media3-container:$media3Version")
     testImplementation("org.mockito:mockito-core:5.8.0")
     testImplementation("org.mockito.kotlin:mockito-kotlin:5.2.1")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.0")

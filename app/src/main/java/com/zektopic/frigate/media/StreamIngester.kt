@@ -32,10 +32,18 @@ import java.nio.ByteOrder
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+/**
+ * Connection state of a single camera stream, mirroring how Frigate reports
+ * camera health: connecting, live, retrying (transient failure, backoff
+ * reconnect scheduled) or offline (persistent failure, still retrying).
+ */
+enum class StreamState { CONNECTING, LIVE, RETRYING, OFFLINE }
+
 class StreamIngester(
     private val context: Context,
     private val config: CameraConfigEntity,
-    private val onFrameExtracted: (Bitmap) -> Unit
+    private val onFrameExtracted: (Bitmap) -> Unit,
+    private val onStateChanged: (StreamState) -> Unit = {}
 ) {
     private val tag = "StreamIngester-${config.id}"
     @Volatile private var isIngesting = false
@@ -46,28 +54,37 @@ class StreamIngester(
     private var cameraProvider: ProcessCameraProvider? = null
 
     // RTSP properties
-    private var rtspSimulationExecutor: java.util.concurrent.ScheduledExecutorService? = null
     private var exoPlayer: androidx.media3.exoplayer.ExoPlayer? = null
-    private var surfaceTexture: SurfaceTexture? = null
-    private var decoderSurface: Surface? = null
     private var frameExtractionExecutor: ExecutorService? = null
-    private var debugFrameCount = 0
+    private val debugFrameCount = java.util.concurrent.atomic.AtomicInteger(0)
     private var currentRtspUrl: String = config.rtspUrl
     private var hasAttemptedFallback = false
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var connectionWatchdogRunnable: Runnable? = null
     private var frameWatchdogRunnable: Runnable? = null
+    private var reconnectRunnable: Runnable? = null
+    private var retryAttempt = 0
     @Volatile private var lastFrameTime = 0L
- 
+    @Volatile private var currentState: StreamState? = null
+
+    private fun setState(state: StreamState) {
+        if (currentState == state) return
+        currentState = state
+        Log.i(tag, "Stream state -> $state")
+        onStateChanged(state)
+    }
+
     fun start() {
         if (isIngesting) return
         isIngesting = true
         val myGeneration = generation.incrementAndGet()
         currentRtspUrl = config.rtspUrl
         hasAttemptedFallback = false
+        retryAttempt = 0
         Log.i(tag, "Starting stream ingestion for ${config.name} (gen=$myGeneration)...")
- 
+        setState(StreamState.CONNECTING)
+
         if (config.rtspUrl.isEmpty()) {
             // Local physical camera
             startLocalCameraIngestion()
@@ -76,13 +93,16 @@ class StreamIngester(
             startRealRtspIngestion(myGeneration)
         }
     }
- 
+
     fun stop() {
         if (!isIngesting) return
         isIngesting = false
-        generation.incrementAndGet() // Invalidate any running extraction loops
         Log.i(tag, "Stopping stream ingestion for ${config.name}...")
- 
+
+        // Stop Real RTSP ingestion (bumps generation, ending the EGL loop which
+        // then tears down its own GL/surface resources on the EGL thread)
+        stopProducers()
+
         // Stop CameraX
         cameraExecutor?.shutdown()
         cameraExecutor = null
@@ -92,13 +112,66 @@ class StreamIngester(
             Log.e(tag, "Error unbinding CameraX", e)
         }
         cameraProvider = null
- 
-        // Stop Real RTSP Ingestion
-        cleanupMediaPlayer()
- 
-        // Stop RTSP Simulation
-        rtspSimulationExecutor?.shutdown()
-        rtspSimulationExecutor = null
+
+        setState(StreamState.OFFLINE)
+    }
+
+    /**
+     * Single owner of producer teardown. Safe to call from the main thread at any
+     * time: invalidates the extraction loop via [generation], cancels watchdogs and
+     * pending reconnects, and releases the player. Surface/SurfaceTexture/GL
+     * resources are NOT touched here — the EGL thread releases those itself when
+     * its loop observes the generation change (releasing them cross-thread races
+     * updateTexImage and leaks the EGL context).
+     */
+    private fun stopProducers() {
+        generation.incrementAndGet() // Invalidate any running extraction loops
+        connectionWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        connectionWatchdogRunnable = null
+        frameWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        frameWatchdogRunnable = null
+        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+
+        val playerToRelease = exoPlayer
+        exoPlayer = null
+        if (playerToRelease != null) {
+            mainHandler.post {
+                try {
+                    playerToRelease.stop()
+                    playerToRelease.release()
+                } catch (e: Exception) {
+                    Log.e(tag, "Error releasing ExoPlayer", e)
+                }
+            }
+        }
+
+        frameExtractionExecutor?.shutdown()
+        frameExtractionExecutor = null
+    }
+
+    /**
+     * Frigate-parity failure handling: no fake frames. Tear everything down and
+     * schedule a real reconnect with exponential backoff (2s..60s). After three
+     * consecutive failures the camera is reported OFFLINE (UI shows the offline
+     * tile) but reconnect attempts continue indefinitely. Must be called on the
+     * main thread.
+     */
+    private fun scheduleReconnect(reason: String) {
+        if (!isIngesting) return
+        stopProducers()
+        retryAttempt++
+        val delayMs = (2000L shl (retryAttempt - 1).coerceAtMost(5)).coerceAtMost(60_000L)
+        setState(if (retryAttempt >= 3) StreamState.OFFLINE else StreamState.RETRYING)
+        Log.w(tag, "Stream down ($reason). Reconnect attempt #$retryAttempt in ${delayMs}ms")
+        val r = Runnable {
+            if (isIngesting) {
+                setState(StreamState.CONNECTING)
+                startRealRtspIngestion(generation.incrementAndGet())
+            }
+        }
+        reconnectRunnable = r
+        mainHandler.postDelayed(r, delayMs)
     }
 
     private fun startLocalCameraIngestion() {
@@ -174,10 +247,8 @@ class StreamIngester(
                 // Setup EGL context on this thread
                 val eglState = setupEgl(config.detectWidth, config.detectHeight)
                 if (eglState == null) {
-                    Log.e(tag, "Failed to setup EGL context. Falling back to simulation.")
-                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        if (isIngesting) startRtspSimulationFallback()
-                    }
+                    Log.e(tag, "Failed to setup EGL context.")
+                    mainHandler.post { scheduleReconnect("EGL setup failed") }
                     return@execute
                 }
 
@@ -190,22 +261,19 @@ class StreamIngester(
                 GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
                 GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
-                // Create SurfaceTexture from GL texture
+                // Create SurfaceTexture from GL texture — owned by this EGL thread
                 val st = SurfaceTexture(texId[0])
                 st.setDefaultBufferSize(config.detectWidth, config.detectHeight)
-                surfaceTexture = st
-
                 val surface = Surface(st)
-                decoderSurface = surface
 
                 // Compile shader program for rendering OES texture to FBO
                 val program = createOesShaderProgram()
                 if (program == 0) {
-                    Log.e(tag, "Failed to create shader program. Falling back to simulation.")
+                    Log.e(tag, "Failed to create shader program.")
+                    surface.release()
+                    st.release()
                     teardownEgl(eglState)
-                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        if (isIngesting) startRtspSimulationFallback()
-                    }
+                    mainHandler.post { scheduleReconnect("shader program creation failed") }
                     return@execute
                 }
 
@@ -226,11 +294,11 @@ class StreamIngester(
 
                 val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
                 if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
-                    Log.e(tag, "FBO incomplete: $status. Falling back to simulation.")
+                    Log.e(tag, "FBO incomplete: $status.")
+                    surface.release()
+                    st.release()
                     teardownEgl(eglState)
-                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        if (isIngesting) startRtspSimulationFallback()
-                    }
+                    mainHandler.post { scheduleReconnect("FBO incomplete") }
                     return@execute
                 }
 
@@ -264,16 +332,22 @@ class StreamIngester(
                             val decoderInfos = androidx.media3.exoplayer.mediacodec.MediaCodecSelector.DEFAULT.getDecoderInfos(
                                 mimeType, requiresSecureDecoder, requiresTunnelingDecoder
                             ).toMutableList()
-                            
+
                             if (mimeType.equals("video/hevc", ignoreCase = true)) {
+                                // Prefer HARDWARE HEVC decoders: the software decoder
+                                // (c2.android/OMX.google) cannot keep up with 2K+ H.265
+                                // (it inits but never outputs → the stream stalls). The
+                                // earlier hardware-init failures were caused by missing
+                                // sprop parameters, which the SDP injection now supplies,
+                                // so hardware is safe to prefer with software as fallback.
                                 decoderInfos.sortWith(Comparator { codec1, codec2 ->
-                                    val isSw1 = codec1.name.startsWith("OMX.google.", ignoreCase = true) || 
+                                    val isSw1 = codec1.name.startsWith("OMX.google.", ignoreCase = true) ||
                                                 codec1.name.startsWith("c2.android.", ignoreCase = true)
-                                    val isSw2 = codec2.name.startsWith("OMX.google.", ignoreCase = true) || 
+                                    val isSw2 = codec2.name.startsWith("OMX.google.", ignoreCase = true) ||
                                                 codec2.name.startsWith("c2.android.", ignoreCase = true)
-                                    if (isSw1 && !isSw2) -1 else if (!isSw1 && isSw2) 1 else 0
+                                    if (isSw1 && !isSw2) 1 else if (!isSw1 && isSw2) -1 else 0
                                 })
-                                Log.d(tag, "MediaCodecSelector sorted HEVC decoders: ${decoderInfos.map { it.name }}")
+                                Log.d(tag, "MediaCodecSelector HEVC decoders (hardware first): ${decoderInfos.map { it.name }}")
                             }
                             decoderInfos
                         }
@@ -283,12 +357,16 @@ class StreamIngester(
                             .setEnableDecoderFallback(true)
 
                         val player = androidx.media3.exoplayer.ExoPlayer.Builder(context, renderersFactory).build()
+                        val isDebuggable = (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+                        if (isDebuggable) {
+                            player.addAnalyticsListener(androidx.media3.exoplayer.util.EventLogger(tag))
+                        }
                         exoPlayer = player
                         
                         val mediaItem = androidx.media3.common.MediaItem.fromUri(currentRtspUrl)
                         val mediaSource = androidx.media3.exoplayer.rtsp.RtspMediaSource.Factory()
                             .setForceUseRtpTcp(true)
-                            .setSocketFactory(RtspInterceptionSocketFactory(tag))
+                            .setSocketFactory(RtspInterceptionSocketFactory(tag, currentRtspUrl))
                             .createMediaSource(mediaItem)
                         
                         player.setMediaSource(mediaSource)
@@ -304,13 +382,8 @@ class StreamIngester(
                                         player.play()
                                     }
                                     androidx.media3.common.Player.STATE_ENDED -> {
-                                        Log.w(tag, "ExoPlayer stream ended. Falling back to simulation.")
-                                        mainHandler.post {
-                                            if (isIngesting) {
-                                                cleanupMediaPlayer()
-                                                startRtspSimulationFallback()
-                                            }
-                                        }
+                                        Log.w(tag, "ExoPlayer stream ended.")
+                                        mainHandler.post { scheduleReconnect("stream ended") }
                                     }
                                 }
                             }
@@ -321,26 +394,14 @@ class StreamIngester(
                                     if (isIngesting) {
                                         val fallback = getFallbackRtspUrl(currentRtspUrl)
                                         if (fallback != null && !hasAttemptedFallback) {
-                                            Log.i(tag, "Attempting fallback RTSP URL: $fallback")
+                                            // Switch to the sub-stream URL; the reconnect path
+                                            // rebuilds the player, watchdogs and lastFrameTime.
+                                            Log.i(tag, "Will retry with fallback RTSP URL: $fallback")
                                             hasAttemptedFallback = true
                                             currentRtspUrl = fallback
-                                            try {
-                                                val newMediaItem = androidx.media3.common.MediaItem.fromUri(fallback)
-                                                val newMediaSource = androidx.media3.exoplayer.rtsp.RtspMediaSource.Factory()
-                                                    .setForceUseRtpTcp(true)
-                                                    .setSocketFactory(RtspInterceptionSocketFactory(tag))
-                                                    .createMediaSource(newMediaItem)
-                                                player.setMediaSource(newMediaSource)
-                                                player.prepare()
-                                            } catch (e: Exception) {
-                                                Log.e(tag, "Failed to switch to fallback URL, falling back to simulation.", e)
-                                                cleanupMediaPlayer()
-                                                startRtspSimulationFallback()
-                                            }
+                                            scheduleReconnect("player error, switching to fallback URL")
                                         } else {
-                                            Log.w(tag, "No fallback URL or fallback already attempted. Falling back to RTSP simulation.")
-                                            cleanupMediaPlayer()
-                                            startRtspSimulationFallback()
+                                            scheduleReconnect("player error: ${error.errorCodeName}")
                                         }
                                     }
                                 }
@@ -348,29 +409,40 @@ class StreamIngester(
                         })
  
                         lastFrameTime = 0L
+                        val prepareTime = System.currentTimeMillis()
                         player.prepare()
 
-                        // Setup connection watchdog
-                        val myGen = generation.get()
+                        // Connection watchdog. Software-decoded 2K H.265 can take well
+                        // over 10s to render a first frame (decoder spin-up + GOP wait),
+                        // so allow 15s to reach READY and 30s for the first frame.
+                        val connectDeadlineMs = 15_000L
+                        val firstFrameDeadlineMs = 30_000L
                         connectionWatchdogRunnable = Runnable {
-                            if (isIngesting && generation.get() == myGen) {
-                                if (exoPlayer?.playbackState != androidx.media3.common.Player.STATE_READY || lastFrameTime == 0L) {
-                                    Log.w(tag, "Connection watchdog triggered: stream failed to connect or produce frames within 6.5 seconds. Falling back to simulation.")
-                                    cleanupMediaPlayer()
-                                    startRtspSimulationFallback()
+                            if (isIngesting && generation.get() == myGeneration && lastFrameTime == 0L) {
+                                val elapsed = System.currentTimeMillis() - prepareTime
+                                val isReady = exoPlayer?.playbackState == androidx.media3.common.Player.STATE_READY
+                                when {
+                                    !isReady && elapsed >= connectDeadlineMs -> {
+                                        Log.w(tag, "Connection watchdog: not READY after ${elapsed}ms.")
+                                        scheduleReconnect("connection watchdog: not ready")
+                                    }
+                                    elapsed >= firstFrameDeadlineMs -> {
+                                        Log.w(tag, "Connection watchdog: READY but no first frame after ${elapsed}ms.")
+                                        scheduleReconnect("connection watchdog: no first frame")
+                                    }
+                                    else -> connectionWatchdogRunnable?.let { mainHandler.postDelayed(it, 2500) }
                                 }
                             }
                         }
-                        connectionWatchdogRunnable?.let { mainHandler.postDelayed(it, 6500) }
+                        connectionWatchdogRunnable?.let { mainHandler.postDelayed(it, connectDeadlineMs) }
 
                         // Setup frame freeze watchdog
                         frameWatchdogRunnable = Runnable {
-                            if (isIngesting && generation.get() == myGen) {
+                            if (isIngesting && generation.get() == myGeneration) {
                                 val now = System.currentTimeMillis()
                                 if (lastFrameTime > 0L && now - lastFrameTime > 8000L) {
-                                    Log.w(tag, "Frame watchdog triggered: no frames received for 8 seconds. Falling back to simulation.")
-                                    cleanupMediaPlayer()
-                                    startRtspSimulationFallback()
+                                    Log.w(tag, "Frame watchdog: no frames received for 8 seconds.")
+                                    scheduleReconnect("frame freeze watchdog")
                                 } else {
                                     frameWatchdogRunnable?.let { mainHandler.postDelayed(it, 4000) }
                                 }
@@ -379,15 +451,15 @@ class StreamIngester(
                         frameWatchdogRunnable?.let { mainHandler.postDelayed(it, 8000) }
 
                     } catch (e: Exception) {
-                        Log.e(tag, "Failed to initialize ExoPlayer. Falling back to simulation.", e)
-                        cleanupMediaPlayer()
-                        startRtspSimulationFallback()
+                        Log.e(tag, "Failed to initialize ExoPlayer.", e)
+                        scheduleReconnect("ExoPlayer initialization failed")
                     }
                 }
 
                 // Frame extraction loop on this EGL thread
                 val stMatrix = FloatArray(16)
                 var lastProcessedTime = 0L
+                var reportedLive = false
                 val intervalMs = 1000L / config.fps
                 val frameAvailable = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -456,10 +528,19 @@ class StreamIngester(
                         bitmap.recycle()
 
                         lastFrameTime = System.currentTimeMillis()
-                        debugFrameCount++
-                        if (debugFrameCount % 30 == 1) {
+                        if (!reportedLive) {
+                            reportedLive = true
+                            mainHandler.post {
+                                if (isIngesting && generation.get() == myGeneration) {
+                                    retryAttempt = 0
+                                    setState(StreamState.LIVE)
+                                }
+                            }
+                        }
+                        val frameNumber = debugFrameCount.incrementAndGet()
+                        if (frameNumber % 30 == 1) {
                             val pixel = flipped.getPixel(flipped.width / 2, flipped.height / 2)
-                            Log.d(tag, "Extracted frame #$debugFrameCount: ${flipped.width}x${flipped.height}, centerPixel=0x${Integer.toHexString(pixel)}")
+                            Log.d(tag, "Extracted frame #$frameNumber: ${flipped.width}x${flipped.height}, centerPixel=0x${Integer.toHexString(pixel)}")
                         }
                         onFrameExtracted(flipped)
 
@@ -468,204 +549,25 @@ class StreamIngester(
                     }
                 }
 
-                // Cleanup GL resources
-                Log.d(tag, "Frame extraction loop ended. Cleaning up GL resources.")
+                // Cleanup GL and surface resources on this EGL thread — the only
+                // thread allowed to touch them (avoids racing updateTexImage)
+                Log.d(tag, "Frame extraction loop ended (gen=$myGeneration). Cleaning up GL/surface resources.")
+                try { st.setOnFrameAvailableListener(null) } catch (e: Exception) {}
                 GLES20.glDeleteFramebuffers(1, fbo, 0)
                 GLES20.glDeleteTextures(1, fboTex, 0)
                 GLES20.glDeleteTextures(1, texId, 0)
                 GLES20.glDeleteProgram(program)
                 teardownEgl(eglState)
+                try { surface.release() } catch (e: Exception) {}
+                try { st.release() } catch (e: Exception) {}
             }
 
         } catch (e: Exception) {
-            Log.e(tag, "Failed to initialize real RTSP stream decoder. Falling back to simulation.", e)
-            cleanupMediaPlayer()
-            startRtspSimulationFallback()
+            Log.e(tag, "Failed to initialize real RTSP stream decoder.", e)
+            mainHandler.post { scheduleReconnect("decoder pipeline initialization failed") }
         }
     }
  
-    private fun startRtspSimulationFallback() {
-        Log.d(tag, "RTSP Client starting simulation fallback for stream: ${config.rtspUrl}")
-        rtspSimulationExecutor = Executors.newSingleThreadScheduledExecutor()
-        val intervalMs = 1000L / config.fps
-
-        var boxX = 50f
-        var boxY = 80f
-        var dx = 5f
-        var dy = 4f
-        val boxWidth = 140f
-        val boxHeight = 90f
-
-        rtspSimulationExecutor?.scheduleAtFixedRate({
-            if (isIngesting) {
-                val width = config.detectWidth
-                val height = config.detectHeight
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                val canvas = android.graphics.Canvas(bitmap)
-
-                // Base background color (Dark Tech Blue-Gray)
-                canvas.drawColor(0xFF0F1015.toInt())
-
-                val paint = android.graphics.Paint().apply {
-                    isAntiAlias = true
-                }
-
-                // 1. Subtle Grid Lines
-                paint.color = 0xFF1D202D.toInt()
-                paint.strokeWidth = 1f
-                val gridSpacing = 40f
-                var x = 0f
-                while (x < width) {
-                    canvas.drawLine(x, 0f, x, height.toFloat(), paint)
-                    x += gridSpacing
-                }
-                var y = 0f
-                while (y < height) {
-                    canvas.drawLine(0f, y, width.toFloat(), y, paint)
-                    y += gridSpacing
-                }
-
-                val pad = 15f
-
-                // 2. Outer Viewfinder Corner Brackets
-                paint.color = 0xFF00F0FF.toInt() // Cyber Cyan
-                paint.style = android.graphics.Paint.Style.STROKE
-                paint.strokeWidth = 3f
-                val bracketLen = 20f
-
-                // Top-Left
-                canvas.drawLine(pad, pad, pad + bracketLen, pad, paint)
-                canvas.drawLine(pad, pad, pad, pad + bracketLen, paint)
-
-                // Top-Right
-                canvas.drawLine(width - pad, pad, width - pad - bracketLen, pad, paint)
-                canvas.drawLine(width - pad, pad, width - pad, pad + bracketLen, paint)
-
-                // Bottom-Left
-                canvas.drawLine(pad, height - pad, pad + bracketLen, height - pad, paint)
-                canvas.drawLine(pad, height - pad, pad, height - pad - bracketLen, paint)
-
-                // Bottom-Right
-                canvas.drawLine(width - pad, height - pad, width - pad - bracketLen, height - pad, paint)
-                canvas.drawLine(width - pad, height - pad, width - pad, height - pad - bracketLen, paint)
-
-                // 3. Simulated Center Target Crosshair
-                paint.color = 0x4000F0FF.toInt() // Semi-transparent Cyan
-                paint.strokeWidth = 1.5f
-                val centerX = width / 2f
-                val centerY = height / 2f
-                canvas.drawLine(centerX - 15f, centerY, centerX + 15f, centerY, paint)
-                canvas.drawLine(centerX, centerY - 15f, centerX, centerY + 15f, paint)
-                canvas.drawCircle(centerX, centerY, 8f, paint)
-
-                // 4. Update and Draw Bouncing "Object Detected" Bounding Box
-                boxX += dx
-                boxY += dy
-                if (boxX < pad || boxX + boxWidth > width - pad) {
-                    dx = -dx
-                    boxX = Math.max(pad, Math.min(boxX, width - pad - boxWidth))
-                }
-                if (boxY < pad + 30f || boxY + boxHeight > height - pad) {
-                    dy = -dy
-                    boxY = Math.max(pad + 30f, Math.min(boxY, height - pad - boxHeight))
-                }
-
-                // Draw bounding box (Electric Emerald)
-                paint.color = 0xFF10B981.toInt()
-                paint.style = android.graphics.Paint.Style.STROKE
-                paint.strokeWidth = 2f
-                canvas.drawRect(boxX, boxY, boxX + boxWidth, boxY + boxHeight, paint)
-
-                // Bounding box fill
-                paint.style = android.graphics.Paint.Style.FILL
-                paint.color = 0x1510B981.toInt()
-                canvas.drawRect(boxX, boxY, boxX + boxWidth, boxY + boxHeight, paint)
-
-                // Label
-                paint.color = 0xFF10B981.toInt()
-                paint.textSize = 12f
-                paint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD)
-                canvas.drawText("PERSON: 94%", boxX + 4f, boxY - 6f, paint)
-
-                // 5. HUD Text Overlay
-                paint.color = 0xFFFFFFFF.toInt()
-                paint.textSize = 13f
-                paint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.NORMAL)
-                canvas.drawText("CAM: ${config.name.toUpperCase()}", 25f, 35f, paint)
-
-                // Blinking Warning Amber dot & "SIMULATION"
-                val isBlinkOn = (System.currentTimeMillis() / 500) % 2 == 0L
-                if (isBlinkOn) {
-                    paint.color = 0xFFF59E0B.toInt() // Warning Amber
-                    canvas.drawCircle(30f, 52f, 4f, paint)
-                    paint.textSize = 11f
-                    canvas.drawText("SIMULATION ACTIVE", 42f, 56f, paint)
-                }
-
-                // Clock overlay
-                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
-                val dateStr = sdf.format(java.util.Date())
-                paint.color = 0xFF9CA3AF.toInt() // Cool gray
-                paint.textSize = 11f
-                canvas.drawText(dateStr, 25f, height - 25f, paint)
-
-                // Stream metadata
-                canvas.drawText("RES: ${config.detectWidth}x${config.detectHeight} @ ${config.fps}FPS", width - 190f, 35f, paint)
-
-                // Moving Sine Wave Graphic at bottom right
-                paint.color = 0xFF00F0FF.toInt() // Cyber Cyan
-                paint.style = android.graphics.Paint.Style.STROKE
-                paint.strokeWidth = 1.5f
-                val wavePath = android.graphics.Path()
-                val startX = width - 150f
-                val baseLineY = height - 28f
-                wavePath.moveTo(startX, baseLineY)
-                val timeFactor = System.currentTimeMillis() / 100.0
-                for (px in 0..120 step 4) {
-                    val angle = (px / 120.0) * Math.PI * 4 + timeFactor
-                    val py = baseLineY + Math.sin(angle).toFloat() * 6f
-                    wavePath.lineTo(startX + px, py)
-                }
-                canvas.drawPath(wavePath, paint)
-
-                onFrameExtracted(bitmap)
-            }
-        }, 0, intervalMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-    }
- 
-    private fun cleanupMediaPlayer() {
-        connectionWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
-        connectionWatchdogRunnable = null
-        frameWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
-        frameWatchdogRunnable = null
-
-        val playerToRelease = exoPlayer
-        exoPlayer = null
-        if (playerToRelease != null) {
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                try {
-                    playerToRelease.stop()
-                    playerToRelease.release()
-                } catch (e: Exception) {
-                    Log.e(tag, "Error releasing ExoPlayer", e)
-                }
-            }
-        }
-
-        try {
-            decoderSurface?.release()
-        } catch (e: Exception) {}
-        decoderSurface = null
-
-        try {
-            surfaceTexture?.release()
-        } catch (e: Exception) {}
-        surfaceTexture = null
-
-        frameExtractionExecutor?.shutdown()
-        frameExtractionExecutor = null
-    }
-
     // Helper extension function to convert CameraX YUV_420_888 ImageProxy to Bitmap
     private fun ImageProxy.toBitmapCustom(): Bitmap? {
         return try {
@@ -700,8 +602,7 @@ class StreamIngester(
         val uPos = uBuffer.position()
         val vPos = vBuffer.position()
 
-        debugFrameCount++
-        if (debugFrameCount % 50 == 1) {
+        if (debugFrameCount.incrementAndGet() % 50 == 1) {
             Log.w(tag, "toBitmapFromYuv: format=${this.format}, width=$width, height=$height, " +
                     "Y: limit=${yBuffer.limit()}, capacity=${yBuffer.capacity()}, pos=${yBuffer.position()}, pixelStride=${yPlane.pixelStride}, rowStride=${yPlane.rowStride}; " +
                     "U: limit=${uBuffer.limit()}, capacity=${uBuffer.capacity()}, pos=${uBuffer.position()}, pixelStride=${uPlane.pixelStride}, rowStride=${uPlane.rowStride}; " +
@@ -963,31 +864,51 @@ class StreamIngester(
 
 // --- RTSP Connection Interception for H.265 Parameter Injection ---
 
-class RtspInterceptionSocketFactory(private val tag: String) : javax.net.SocketFactory() {
+/**
+ * Cache of REAL H.265 parameter sets sniffed from each stream's in-band RTP
+ * data, keyed by RTSP URL. Populated by [RtspInterceptionInputStream] when a
+ * camera's SDP lacks sprop parameters (fallback constants get injected on the
+ * first attempt and can mis-configure the decoder — e.g. 1080p CSD on a
+ * 2560x1440 stream stalls output silently); consumed by maybeModifySdp on the
+ * reconnect so the second attempt is configured with the stream's true
+ * VPS/SPS/PPS.
+ */
+object SpropCache {
+    val map = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+}
+
+class RtspInterceptionSocketFactory(
+    private val tag: String,
+    private val streamKey: String = ""
+) : javax.net.SocketFactory() {
     private val delegate = javax.net.SocketFactory.getDefault()
 
     override fun createSocket(): java.net.Socket {
-        return RtspInterceptionSocket(delegate.createSocket(), tag)
+        return RtspInterceptionSocket(delegate.createSocket(), tag, streamKey)
     }
 
     override fun createSocket(host: String?, port: Int): java.net.Socket {
-        return RtspInterceptionSocket(delegate.createSocket(host, port), tag)
+        return RtspInterceptionSocket(delegate.createSocket(host, port), tag, streamKey)
     }
 
     override fun createSocket(host: String?, port: Int, localHost: java.net.InetAddress?, localPort: Int): java.net.Socket {
-        return RtspInterceptionSocket(delegate.createSocket(host, port, localHost, localPort), tag)
+        return RtspInterceptionSocket(delegate.createSocket(host, port, localHost, localPort), tag, streamKey)
     }
 
     override fun createSocket(address: java.net.InetAddress?, port: Int): java.net.Socket {
-        return RtspInterceptionSocket(delegate.createSocket(address, port), tag)
+        return RtspInterceptionSocket(delegate.createSocket(address, port), tag, streamKey)
     }
 
     override fun createSocket(address: java.net.InetAddress?, port: Int, localAddress: java.net.InetAddress?, localPort: Int): java.net.Socket {
-        return RtspInterceptionSocket(delegate.createSocket(address, port, localAddress, localPort), tag)
+        return RtspInterceptionSocket(delegate.createSocket(address, port, localAddress, localPort), tag, streamKey)
     }
 }
 
-class RtspInterceptionSocket(private val delegate: java.net.Socket, private val tag: String) : java.net.Socket() {
+class RtspInterceptionSocket(
+    private val delegate: java.net.Socket,
+    private val tag: String,
+    private val streamKey: String = ""
+) : java.net.Socket() {
     override fun connect(endpoint: java.net.SocketAddress?) {
         try {
             delegate.connect(endpoint, 4000)
@@ -1020,11 +941,23 @@ class RtspInterceptionSocket(private val delegate: java.net.Socket, private val 
     override fun getChannel() = delegate.channel
 
     override fun getInputStream(): java.io.InputStream {
-        return RtspInterceptionInputStream(delegate.inputStream, tag)
+        return RtspInterceptionInputStream(delegate.inputStream, tag, streamKey)
     }
 
     override fun getOutputStream(): java.io.OutputStream {
-        return delegate.outputStream
+        return object : java.io.FilterOutputStream(delegate.outputStream) {
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                // RTSP requests are written as one buffer each; interleaved
+                // binary frames start with '$' (0x24) — only log the text ones
+                if (len in 1..4096 && b[off] != 0x24.toByte()) {
+                    val text = String(b, off, len, java.nio.charset.StandardCharsets.US_ASCII)
+                    if (text.firstOrNull()?.isLetter() == true) {
+                        Log.d(tag, "RTSP >>> ${text.trimEnd()}")
+                    }
+                }
+                out.write(b, off, len)
+            }
+        }
     }
 
     override fun setTcpNoDelay(on: Boolean) { delegate.tcpNoDelay = on }
@@ -1051,17 +984,32 @@ class RtspInterceptionSocket(private val delegate: java.net.Socket, private val 
     override fun isOutputShutdown(): Boolean = delegate.isOutputShutdown
 }
 
-class RtspInterceptionInputStream(private val upstream: java.io.InputStream, private val tag: String) : java.io.InputStream() {
+class RtspInterceptionInputStream(
+    private val upstream: java.io.InputStream,
+    private val tag: String,
+    private val streamKey: String = ""
+) : java.io.InputStream() {
     private var buffer = ByteArray(0)
     private var bufferPos = 0
     private var bufferLimit = 0
     @Volatile private var isInterceptionDone = false
+    // While true, keep parsing interleaved frames after the SDP so in-band
+    // VPS/SPS/PPS NALs can be captured into SpropCache (frames pass through
+    // unmodified). Cleared once all three are found.
+    @Volatile private var sniffForSprop = false
+    @Volatile private var seenInterleaved = false
+    private val sniffedParams = HashMap<String, String>()
+
+    // Keep parsing framed messages until interleaved media starts (so the
+    // RTSP SETUP/PLAY responses are visible in the log) and while sniffing.
+    private val passthrough: Boolean
+        get() = isInterceptionDone && !sniffForSprop && seenInterleaved
 
     override fun read(): Int {
         if (bufferPos < bufferLimit) {
             return buffer[bufferPos++].toInt() and 0xFF
         }
-        if (isInterceptionDone) {
+        if (passthrough) {
             return upstream.read()
         }
         fillBuffer()
@@ -1080,7 +1028,7 @@ class RtspInterceptionInputStream(private val upstream: java.io.InputStream, pri
             bufferPos += toCopy
             return toCopy
         }
-        if (isInterceptionDone) {
+        if (passthrough) {
             return upstream.read(b, off, len)
         }
         fillBuffer()
@@ -1112,6 +1060,7 @@ class RtspInterceptionInputStream(private val upstream: java.io.InputStream, pri
         if (firstByte == -1) return
 
         if (firstByte == 0x24) { // '$'
+            seenInterleaved = true
             val channel = upstream.read()
             if (channel == -1) {
                 buffer = byteArrayOf(0x24)
@@ -1145,6 +1094,13 @@ class RtspInterceptionInputStream(private val upstream: java.io.InputStream, pri
                 readOffset += read
                 remaining -= read
             }
+            if (sniffForSprop) {
+                try {
+                    sniffRtpPacket(packetBytes, readOffset)
+                } catch (e: Exception) {
+                    Log.w(tag, "sprop sniffing failed on RTP packet: ${e.message}")
+                }
+            }
             buffer = packetBytes
             bufferLimit = readOffset
             return
@@ -1170,7 +1126,8 @@ class RtspInterceptionInputStream(private val upstream: java.io.InputStream, pri
 
         val headerBytes = headerStream.toByteArray()
         val headerStr = String(headerBytes, java.nio.charset.StandardCharsets.UTF_8)
-        
+        Log.d(tag, "RTSP <<< ${headerStr.trimEnd()}")
+
         var contentType: String? = null
         var contentLength = 0
         val headerLines = headerStr.split("\r\n", "\n")
@@ -1204,9 +1161,20 @@ class RtspInterceptionInputStream(private val upstream: java.io.InputStream, pri
         if (contentType != null && contentType.toLowerCase(java.util.Locale.US).contains("application/sdp")) {
             val sdp = String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8)
             Log.d(tag, "Intercepted SDP Description:\n$sdp")
-            
-            val modifiedSdp = maybeModifySdp(sdp)
+
+            val modifiedSdp = maybeModifySdp(sdp, tag, streamKey)
             isInterceptionDone = true
+
+            // If the camera's SDP lacked sprop parameters and we have no real ones
+            // cached yet, the fallback constants were injected — sniff the true
+            // in-band parameter sets from the RTP data for the reconnect attempt.
+            if (streamKey.isNotEmpty() &&
+                sdpNeedsSpropInjection(sdp) &&
+                !SpropCache.map.containsKey(streamKey)
+            ) {
+                sniffForSprop = true
+                Log.i(tag, "SDP lacked H.265 sprop parameters; sniffing in-band parameter sets for $streamKey")
+            }
             
             if (modifiedSdp != sdp) {
                 Log.d(tag, "Modified SDP Description:\n$modifiedSdp")
@@ -1242,6 +1210,62 @@ class RtspInterceptionInputStream(private val upstream: java.io.InputStream, pri
         }
     }
 
+    /**
+     * Inspect an interleaved RTSP frame ('$' | channel | 16-bit len | payload)
+     * and capture H.265 VPS/SPS/PPS NAL units from channel-0 RTP packets.
+     */
+    private fun sniffRtpPacket(packet: ByteArray, length: Int) {
+        if (length < 18) return
+        val channel = packet[1].toInt() and 0xFF
+        if (channel != 0) return // video RTP is on the first interleaved channel
+
+        val rtpStart = 4
+        val b0 = packet[rtpStart].toInt() and 0xFF
+        if ((b0 shr 6) != 2) return // not RTP version 2
+        val csrcCount = b0 and 0x0F
+        var payloadStart = rtpStart + 12 + csrcCount * 4
+        if ((b0 and 0x10) != 0) { // header extension present
+            if (payloadStart + 4 > length) return
+            val extWords = ((packet[payloadStart + 2].toInt() and 0xFF) shl 8) or
+                (packet[payloadStart + 3].toInt() and 0xFF)
+            payloadStart += 4 + extWords * 4
+        }
+        if (payloadStart + 2 > length) return
+
+        when (val nalType = (packet[payloadStart].toInt() shr 1) and 0x3F) {
+            32, 33, 34 -> storeParamSet(nalType, packet.copyOfRange(payloadStart, length))
+            48 -> { // aggregation packet: 2-byte AP header, then [16-bit size][NALU]...
+                var pos = payloadStart + 2
+                while (pos + 2 <= length) {
+                    val size = ((packet[pos].toInt() and 0xFF) shl 8) or (packet[pos + 1].toInt() and 0xFF)
+                    pos += 2
+                    if (size <= 0 || pos + size > length) break
+                    val t = (packet[pos].toInt() shr 1) and 0x3F
+                    if (t == 32 || t == 33 || t == 34) {
+                        storeParamSet(t, packet.copyOfRange(pos, pos + size))
+                    }
+                    pos += size
+                }
+            }
+        }
+    }
+
+    private fun storeParamSet(nalType: Int, nal: ByteArray) {
+        val key = when (nalType) {
+            32 -> "sprop-vps"
+            33 -> "sprop-sps"
+            else -> "sprop-pps"
+        }
+        if (sniffedParams.containsKey(key)) return
+        sniffedParams[key] = java.util.Base64.getEncoder().encodeToString(nal)
+        Log.i(tag, "Sniffed in-band $key (${nal.size} bytes) from RTP stream")
+        if (sniffedParams.size == 3) {
+            SpropCache.map[streamKey] = sniffedParams.toMap()
+            sniffForSprop = false
+            Log.i(tag, "All H.265 parameter sets captured for $streamKey; real sprop will be injected on the next connect")
+        }
+    }
+
     private fun rewriteContentLength(headerLines: List<String>, newBodySize: Int): String {
         val newLines = mutableListOf<String>()
         for (line in headerLines) {
@@ -1257,7 +1281,16 @@ class RtspInterceptionInputStream(private val upstream: java.io.InputStream, pri
     }
 
     companion object {
-        internal fun maybeModifySdp(sdp: String, tag: String = "RtspInterception"): String {
+        /**
+         * True when the SDP advertises an H.265 track but provides no sprop-sps
+         * parameter — i.e. maybeModifySdp will have to inject parameter sets.
+         */
+        internal fun sdpNeedsSpropInjection(sdp: String): Boolean {
+            val lower = sdp.lowercase(java.util.Locale.US)
+            return lower.contains("h265") && !lower.contains("sprop-sps")
+        }
+
+        internal fun maybeModifySdp(sdp: String, tag: String = "RtspInterception", streamKey: String = ""): String {
             // 1. Strip any audio media description blocks
             val filteredLines = mutableListOf<String>()
             var inAudioBlock = false
@@ -1296,11 +1329,20 @@ class RtspInterceptionInputStream(private val upstream: java.io.InputStream, pri
                     }
                 }
 
-                // Dummy parameters if completely missing or to supply missing keys
-                // We use valid parameter sets from a working stream to prevent ArrayIndexOutOfBoundsException in Media3's SPS parser
-                val dummyVps = "QAEMAf//AWAAAAMAsAAAAwAAAwCWrAk="
-                val dummySps = "QgEBAWAAAAMAsAAAAwAAAwCWoAPAgBEHy+u5MkupSCgwMBdoUJQ="
-                val dummyPps = "RAHA4w8CCEA="
+                // Media3's RTSP H.265 support requires sprop parameters, so when a
+                // camera omits them something must be injected. Prefer REAL
+                // parameter sets previously sniffed from this stream's RTP data
+                // (SpropCache); fall back to known-good 1080p sets on the first
+                // attempt only — a mismatched CSD can silently stall the decoder,
+                // which the watchdog turns into a reconnect that then uses the
+                // sniffed values.
+                val cached = if (streamKey.isNotEmpty()) SpropCache.map[streamKey] else null
+                if (cached != null) {
+                    Log.i(tag, "Using sniffed sprop parameters for $streamKey")
+                }
+                val dummyVps = cached?.get("sprop-vps") ?: "QAEMAf//AWAAAAMAsAAAAwAAAwCWrAk="
+                val dummySps = cached?.get("sprop-sps") ?: "QgEBAWAAAAMAsAAAAwAAAwCWoAPAgBEHy+u5MkupSCgwMBdoUJQ="
+                val dummyPps = cached?.get("sprop-pps") ?: "RAHA4w8CCEA="
 
                 val newLines = mutableListOf<String>()
                 for (line in filteredLines) {

@@ -2,108 +2,140 @@ package com.zektopic.frigate.media
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.media.MediaFormat
-import android.media.MediaMuxer
 import android.util.Log
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 
+/**
+ * Motion-triggered MP4 clip recording and snapshot capture.
+ *
+ * A recording session is opened per camera on motion ([onMotion]); every frame
+ * that arrives while a session is active is encoded ([offerFrame]). The session
+ * finalizes after [TAIL_MS] of no motion or once [MAX_CLIP_MS] is reached,
+ * producing a playable MP4 in the app's external files dir. The completed clip's
+ * path is delivered via [onClipFinished] so the caller can attach it to an event.
+ */
 class ClipRecorder(
     private val context: Context,
     private val nvrDao: NvrDao
 ) {
     private val tag = "ClipRecorder"
-    
-    // Directory mapping in scoped storage to keep things tidy
+
     private val baseRecordingsDir: File by lazy {
-        File(context.getExternalFilesDir(null), "frigate_recordings").apply {
-            if (!exists()) mkdirs()
+        File(context.getExternalFilesDir(null), "frigate_recordings").apply { if (!exists()) mkdirs() }
+    }
+
+    private data class Session(
+        val encoder: VideoClipEncoder,
+        val file: File,
+        val startedAt: Long,
+        @Volatile var lastMotionAt: Long
+    )
+
+    private val sessions = ConcurrentHashMap<String, Session>()
+
+    companion object {
+        private const val TAIL_MS = 6_000L       // keep recording this long after motion stops
+        private const val MAX_CLIP_MS = 60_000L  // hard cap on a single clip
+    }
+
+    /** Signal that motion was just detected on this camera — opens or extends a recording. */
+    @Synchronized
+    fun onMotion(camera: CameraConfigEntity, firstFrame: Bitmap) {
+        val now = System.currentTimeMillis()
+        val existing = sessions[camera.id]
+        if (existing != null) {
+            existing.lastMotionAt = now
+            return
+        }
+        val file = File(baseRecordingsDir, "${camera.id}_${now}.mp4")
+        val w = if (firstFrame.width > 0) firstFrame.width else camera.detectWidth
+        val h = if (firstFrame.height > 0) firstFrame.height else camera.detectHeight
+        val encoder = VideoClipEncoder(w, h, camera.fps.coerceAtLeast(1), file)
+        if (!encoder.start()) {
+            Log.e(tag, "Could not start clip encoder for ${camera.name}")
+            return
+        }
+        sessions[camera.id] = Session(encoder, file, now, now)
+        Log.i(tag, "Started recording clip for ${camera.name}: ${file.name}")
+    }
+
+    /** Feed a frame into an active session (no-op if the camera isn't recording). */
+    fun offerFrame(cameraId: String, bitmap: Bitmap) {
+        val session = sessions[cameraId] ?: return
+        val now = System.currentTimeMillis()
+        val motionExpired = now - session.lastMotionAt > TAIL_MS
+        val tooLong = now - session.startedAt > MAX_CLIP_MS
+        if (motionExpired || tooLong) {
+            finishSession(cameraId, session)
+        } else {
+            session.encoder.encodeFrame(bitmap)
         }
     }
 
-    /**
-     * Records a video segment or saves a high-quality frame snapshot when an object is detected.
-     */
-    fun saveEventSnapshot(cameraId: String, label: String, bitmap: Bitmap): File? {
-        val filename = "${cameraId}_${label}_${System.currentTimeMillis()}.jpg"
-        val destFile = File(baseRecordingsDir, filename)
+    /** Returns the completed clip path if a session for this camera just finalized, else null. */
+    @Synchronized
+    private fun finishSession(cameraId: String, session: Session): String? {
+        if (sessions.remove(cameraId) == null) return null
+        val ok = session.encoder.stop()
+        return if (ok) {
+            Log.i(tag, "Finished clip ${session.file.name} (${session.file.length()} bytes)")
+            session.file.absolutePath
+        } else {
+            session.file.delete()
+            Log.w(tag, "Clip for $cameraId produced no playable file; discarded")
+            null
+        }
+    }
 
-        var fos: FileOutputStream? = null
+    /** Poll for any sessions that have gone idle and finalize them; returns finished (cameraId, path) pairs. */
+    fun reapIdleSessions(): List<Pair<String, String>> {
+        val finished = mutableListOf<Pair<String, String>>()
+        val now = System.currentTimeMillis()
+        for ((cameraId, session) in sessions) {
+            if (now - session.lastMotionAt > TAIL_MS || now - session.startedAt > MAX_CLIP_MS) {
+                finishSession(cameraId, session)?.let { finished.add(cameraId to it) }
+            }
+        }
+        return finished
+    }
+
+    /** Stop and finalize all recordings (service shutdown). */
+    fun stopAll() {
+        for ((cameraId, session) in sessions.toMap()) {
+            finishSession(cameraId, session)
+        }
+    }
+
+    fun saveEventSnapshot(cameraId: String, label: String, bitmap: Bitmap): File? {
+        val destFile = File(baseRecordingsDir, "${cameraId}_${label}_${System.currentTimeMillis()}.jpg")
         return try {
-            fos = FileOutputStream(destFile)
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, fos)
-            fos.flush()
-            Log.d(tag, "Saved event snapshot on disk: ${destFile.absolutePath}")
+            FileOutputStream(destFile).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }
             destFile
         } catch (e: IOException) {
-            Log.e(tag, "Failed to save event snapshot to disk", e)
+            Log.e(tag, "Failed to save event snapshot", e)
             null
-        } finally {
-            fos?.close()
         }
     }
 
-    /**
-     * Enforces video retention schedules, purging obsolete files and cleaning up Room database items.
-     */
     suspend fun enforceRetentionPolicy(camera: CameraConfigEntity) {
         try {
             val expirationLimitMs = System.currentTimeMillis() - (camera.recordingRetentionDays * 24 * 60 * 60 * 1000).toLong()
-            
-            // Delete historical files from disk that exceed limit
-            val filePrefix = "${camera.id}_"
-            val files = baseRecordingsDir.listFiles { _, name -> name.startsWith(filePrefix) } ?: emptyArray()
-
-            var countPurged = 0
+            val files = baseRecordingsDir.listFiles { _, name -> name.startsWith("${camera.id}_") } ?: emptyArray()
+            var purged = 0
             for (file in files) {
-                // Parse timestamp out of standard naming structure e.g., camera_label_timestamp.jpg
-                val nameParts = file.nameWithoutExtension.split("_")
-                if (nameParts.size >= 3) {
-                    val timestampStr = nameParts[2]
-                    val timestamp = timestampStr.toLongOrNull()
-                    if (timestamp != null && timestamp < expirationLimitMs) {
-                        if (file.delete()) {
-                            countPurged++
-                        }
-                    }
-                }
+                val parts = file.nameWithoutExtension.split("_")
+                val timestamp = parts.lastOrNull()?.toLongOrNull()
+                if (timestamp != null && timestamp < expirationLimitMs && file.delete()) purged++
             }
-
-            // Sync database listings
             nvrDao.deleteEventsOlderThan(expirationLimitMs)
-            
-            if (countPurged > 0) {
-                Log.i(tag, "Cleaned up $countPurged expired recording file(s) for camera: ${camera.name}")
-            }
+            if (purged > 0) Log.i(tag, "Purged $purged expired recording(s) for ${camera.name}")
         } catch (e: Exception) {
-            Log.e(tag, "Error performing file retention sweep", e)
-        }
-    }
-
-    /**
-     * Simulates MP4 clip recording initialization (using MediaMuxer).
-     */
-    fun recordEventClip(cameraId: String, durationSecs: Int): File? {
-        val destFile = File(baseRecordingsDir, "${cameraId}_clip_${System.currentTimeMillis()}.mp4")
-        
-        try {
-            // Setup MediaMuxer container for writing standard MP4 containers
-            val muxer = MediaMuxer(destFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            
-            // In a real device, the NVR service writes encoded video frames from MediaCodec.
-            // We simulate a basic configuration structure and start/stop the muxer container:
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 640, 360)
-            // Add mock tracks and start
-            Log.d(tag, "Created event clip container: ${destFile.absolutePath}")
-            
-            // We return the file placeholder representing the saved clip
-            return destFile
-        } catch (e: Exception) {
-            Log.e(tag, "Failed to initialize MediaMuxer recording clip", e)
-            return null
+            Log.e(tag, "Retention sweep error", e)
         }
     }
 }
