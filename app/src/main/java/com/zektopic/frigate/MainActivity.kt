@@ -132,14 +132,11 @@ class MainActivity : ComponentActivity() {
                     streamStates = streamStates,
                     onSaveConfig = { yamlText ->
                         val parsedCameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlText)
-                        nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlText))
-                        val existing = nvrDao.getAllCameraConfigs()
-                        for (c in existing) {
-                            nvrDao.deleteCameraConfig(c)
-                        }
-                        for (c in parsedCameras) {
-                            nvrDao.insertCameraConfig(c)
-                        }
+                        // Atomic replace — the service never sees a momentary empty camera list
+                        nvrDao.applyConfig(
+                            com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlText),
+                            parsedCameras
+                        )
                     },
                     onAddMockCamera = {
                         lifecycleScope.launch(Dispatchers.IO) {
@@ -314,16 +311,11 @@ class MainActivity : ComponentActivity() {
                   enabled: true
         """.trimIndent()
 
-        nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = defaultYaml))
-
         val parsedCameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(defaultYaml)
-        val existing = nvrDao.getAllCameraConfigs()
-        for (c in existing) {
-            nvrDao.deleteCameraConfig(c)
-        }
-        for (camera in parsedCameras) {
-            nvrDao.insertCameraConfig(camera)
-        }
+        nvrDao.applyConfig(
+            com.zektopic.frigate.data.SystemConfigEntity(configYaml = defaultYaml),
+            parsedCameras
+        )
 
         // Events are created at runtime by the NVR service when motion is detected,
         // with real locally-recorded MP4 clips attached. No mock events are seeded.
