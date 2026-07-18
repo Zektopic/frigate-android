@@ -115,10 +115,14 @@ class MainActivity : ComponentActivity() {
                     } ?: run { streamStates = emptyMap() }
                 }
 
-                // Auto-seed database with mock cameras and events if empty
-                LaunchedEffect(cameraConfigs) {
-                    if (cameraConfigs.isEmpty()) {
-                        lifecycleScope.launch(Dispatchers.IO) {
+                // Seed the default config exactly once, on genuine first run.
+                // IMPORTANT: gate on the real DB (getSystemConfig() == null), NOT on
+                // the collected `cameraConfigs` — that starts as emptyList() on every
+                // launch before Room loads, so seeding there would overwrite the
+                // user's saved config with defaults on every restart.
+                LaunchedEffect(Unit) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        if (nvrDao.getSystemConfig() == null) {
                             seedMockCameras()
                         }
                     }
