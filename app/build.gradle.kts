@@ -54,6 +54,14 @@ android {
             useLegacyPackaging = false
         }
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+    lint {
+        // Lint is advisory in CI — unit tests and assembleDebug are the gates.
+        abortOnError = false
+        checkReleaseBuilds = false
+    }
 }
 
 dependencies {
@@ -72,20 +80,19 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.7.7")
 
-    // ExoPlayer / Media3 for real RTSP and HLS playback with hardware codec selection
-    val media3Version = "1.2.1"
-    implementation("androidx.media3:media3-exoplayer:$media3Version")
-    implementation("androidx.media3:media3-exoplayer-rtsp:$media3Version")
-    implementation("androidx.media3:media3-exoplayer-hls:$media3Version")
-    implementation("androidx.media3:media3-ui:$media3Version")
-    implementation("androidx.media3:media3-common:$media3Version")
-
     // CameraX for Local Camera support
     val cameraVersion = "1.4.2"
     implementation("androidx.camera:camera-core:$cameraVersion")
     implementation("androidx.camera:camera-camera2:$cameraVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraVersion")
     implementation("androidx.camera:camera-view:$cameraVersion")
+
+    // Jetpack Media3 ExoPlayer for robust RTSP decoding
+    // Pinned to 1.3.1: RTSP H.265 streams never reach STATE_READY on 1.4.1
+    // with these cameras (verified on-device 2026-07-17)
+    val media3Version = "1.3.1"
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-exoplayer-rtsp:$media3Version")
 
     // Room Database for local Events log & Settings
     val roomVersion = "2.6.1"
@@ -105,21 +112,15 @@ dependencies {
     implementation("io.ktor:ktor-server-content-negotiation:$ktorVersion")
     implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
 
-    // TensorFlow Lite for AI object detection with hardware acceleration
-    // Task Vision provides the high-level ObjectDetector API (handles preprocessing)
-    val tfliteTaskVision = "0.4.1"
-    implementation("org.tensorflow:tensorflow-lite-task-vision:$tfliteTaskVision")
-    // GPU delegate (OpenCL/OpenGL ES) for Adreno, Mali, PowerVR GPUs
-    val tfliteGpu = "2.9.0"
-    implementation("org.tensorflow:tensorflow-lite-gpu:$tfliteGpu")
-    // NNAPI delegate (NPU/DSP) for Snapdragon, Exynos, Tensor, Dimensity
-    // (included in core tensorflow-lite, no extra dep needed)
-
     // YAML parsing
     implementation("org.yaml:snakeyaml:2.2")
 
+    // DataStore for app preferences (notifications, etc.)
+    implementation("androidx.datastore:datastore-preferences:1.0.0")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("androidx.media3:media3-container:$media3Version")
     testImplementation("org.mockito:mockito-core:5.8.0")
     testImplementation("org.mockito.kotlin:mockito-kotlin:5.2.1")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.0")

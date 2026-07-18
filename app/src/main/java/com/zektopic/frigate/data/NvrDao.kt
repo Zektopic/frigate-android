@@ -22,6 +22,22 @@ interface NvrDao {
     @Delete
     suspend fun deleteCameraConfig(config: CameraConfigEntity)
 
+    @Query("DELETE FROM camera_configs")
+    suspend fun deleteAllCameraConfigs()
+
+    /**
+     * Atomically replace the whole configuration. Room fires invalidation only
+     * after the transaction commits, so observers of the camera/system-config
+     * flows see old→new and never a momentary empty list (which the service
+     * would otherwise treat as "stop all streams").
+     */
+    @Transaction
+    suspend fun applyConfig(systemConfig: SystemConfigEntity, cameras: List<CameraConfigEntity>) {
+        insertSystemConfig(systemConfig)
+        deleteAllCameraConfigs()
+        for (camera in cameras) insertCameraConfig(camera)
+    }
+
     // Events Queries
     @Query("SELECT * FROM nvr_events ORDER BY timestamp DESC")
     fun getAllEventsFlow(): Flow<List<EventEntity>>
@@ -34,6 +50,12 @@ interface NvrDao {
 
     @Query("DELETE FROM nvr_events WHERE timestamp < :expirationTimestamp")
     suspend fun deleteEventsOlderThan(expirationTimestamp: Long)
+
+    @Query("DELETE FROM nvr_events")
+    suspend fun deleteAllEvents()
+
+    @Query("UPDATE nvr_events SET videoPath = :videoPath WHERE id = :eventId")
+    suspend fun updateEventVideoPath(eventId: Long, videoPath: String)
 
     @Query("SELECT COUNT(*) FROM nvr_events")
     fun getEventCountFlow(): Flow<Long>

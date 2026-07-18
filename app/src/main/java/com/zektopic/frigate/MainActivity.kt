@@ -86,6 +86,7 @@ class MainActivity : ComponentActivity() {
                 val systemConfig by nvrDao.getSystemConfigFlow().collectAsState(initial = null)
                 var isServiceRunning by remember { mutableStateOf(false) }
                 val latestFrames = remember { mutableStateMapOf<String, Bitmap>() }
+                var streamStates by remember { mutableStateOf<Map<String, com.zektopic.frigate.media.StreamState>>(emptyMap()) }
 
                 // Periodically check if background service is running and auto-start it
                 LaunchedEffect(Unit) {
@@ -105,10 +106,23 @@ class MainActivity : ComponentActivity() {
                     } ?: latestFrames.clear()
                 }
 
-                // Auto-seed database with mock cameras and events if empty
-                LaunchedEffect(cameraConfigs) {
-                    if (cameraConfigs.isEmpty()) {
-                        lifecycleScope.launch(Dispatchers.IO) {
+                // Collect per-camera connection states from the bound service
+                LaunchedEffect(nvrService) {
+                    nvrService?.let { service ->
+                        service.streamStates.collect { states ->
+                            streamStates = states
+                        }
+                    } ?: run { streamStates = emptyMap() }
+                }
+
+                // Seed the default config exactly once, on genuine first run.
+                // IMPORTANT: gate on the real DB (getSystemConfig() == null), NOT on
+                // the collected `cameraConfigs` — that starts as emptyList() on every
+                // launch before Room loads, so seeding there would overwrite the
+                // user's saved config with defaults on every restart.
+                LaunchedEffect(Unit) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        if (nvrDao.getSystemConfig() == null) {
                             seedMockCameras()
                         }
                     }
@@ -119,16 +133,14 @@ class MainActivity : ComponentActivity() {
                     events = events,
                     systemConfig = systemConfig,
                     latestFrames = latestFrames,
+                    streamStates = streamStates,
                     onSaveConfig = { yamlText ->
                         val parsedCameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlText)
-                        nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlText))
-                        val existing = nvrDao.getAllCameraConfigs()
-                        for (c in existing) {
-                            nvrDao.deleteCameraConfig(c)
-                        }
-                        for (c in parsedCameras) {
-                            nvrDao.insertCameraConfig(c)
-                        }
+                        // Atomic replace — the service never sees a momentary empty camera list
+                        nvrDao.applyConfig(
+                            com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlText),
+                            parsedCameras
+                        )
                     },
                     onAddMockCamera = {
                         lifecycleScope.launch(Dispatchers.IO) {
@@ -143,6 +155,10 @@ class MainActivity : ComponentActivity() {
                     },
                     onStopNvrService = {
                         stopNvrService()
+                    },
+                    onClearAllRecordings = {
+                        // Files are deleted by the Storage section; clear the event log too
+                        nvrDao.deleteAllEvents()
                     },
                     isServiceRunning = isServiceRunning
                 )
@@ -177,94 +193,136 @@ class MainActivity : ComponentActivity() {
 
     private suspend fun seedMockCameras() {
         val defaultYaml = """
+            version: 0.18.0
+
             mqtt:
               host: 192.168.1.10
               port: 1883
-            
+
+            detect:
+              width: 640
+              height: 360
+              fps: 5
+
+            objects:
+              track:
+                - person
+                - car
+                - bird
+
+            # All cameras are pulled through the go2rtc restreamer on the home
+            # server. Direct camera URLs exhaust the cameras' 1-2 RTSP session
+            # slots (already held by Frigate/birdseye) — DESCRIBE succeeds but
+            # no RTP data ever flows, so the app must use go2rtc like every
+            # other consumer.
             cameras:
               front_camera:
                 ffmpeg:
                   inputs:
-                    - path: rtsp://admin:passwd@192.168.1.33:554/live/ch0
+                    - path: rtsp://192.168.1.9:8554/front_camera
                       roles:
                         - detect
-                detect:
-                  width: 640
-                  height: 360
-                  fps: 5
-                motion:
-                  threshold: 2
-            
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
+
+              work_camera:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://192.168.1.9:8554/work_camera
+                      roles:
+                        - detect
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 0.5
+                snapshots:
+                  enabled: true
+
+              work_room:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://192.168.1.9:8554/work_room
+                      roles:
+                        - detect
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 0.5
+                snapshots:
+                  enabled: true
+
+              stairway_camera:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://192.168.1.9:8554/stairway_camera
+                      roles:
+                        - detect
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
+
               back_garden:
                 ffmpeg:
                   inputs:
-                    - path: rtsp://admin:manupa@192.168.1.20:554/live/ch0
+                    - path: rtsp://192.168.1.9:8554/back_garden
                       roles:
                         - detect
-                detect:
-                  width: 640
-                  height: 360
-                  fps: 5
-                motion:
-                  threshold: 2
-            
-              local_sensor:
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
+
+              kitchen_camera:
                 ffmpeg:
                   inputs:
-                    - path: ""
+                    - path: rtsp://192.168.1.9:8554/kitchen_camera
                       roles:
                         - detect
-                detect:
-                  width: 640
-                  height: 480
-                  fps: 10
-                motion:
-                  threshold: 2
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
+
+              living_room:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://192.168.1.9:8554/living_room
+                      roles:
+                        - detect
+                        - record
+                record:
+                  enabled: true
+                  retain:
+                    days: 3
+                snapshots:
+                  enabled: true
         """.trimIndent()
 
-        nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = defaultYaml))
-
         val parsedCameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(defaultYaml)
-        val existing = nvrDao.getAllCameraConfigs()
-        for (c in existing) {
-            nvrDao.deleteCameraConfig(c)
-        }
-        for (camera in parsedCameras) {
-            nvrDao.insertCameraConfig(camera)
-        }
+        nvrDao.applyConfig(
+            com.zektopic.frigate.data.SystemConfigEntity(configYaml = defaultYaml),
+            parsedCameras
+        )
 
-        // Seed some mock historical events with real demo video urls for playback testing
-        val videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-        val event1 = EventEntity(
-            cameraId = "front_camera",
-            label = "motion",
-            confidence = 1.00f,
-            timestamp = System.currentTimeMillis() - 50000,
-            snapshotPath = null,
-            videoPath = videoUrl,
-            zone = "Driveway Zone"
-        )
-        val event2 = EventEntity(
-            cameraId = "back_garden",
-            label = "motion",
-            confidence = 1.00f,
-            timestamp = System.currentTimeMillis() - 120000,
-            snapshotPath = null,
-            videoPath = videoUrl,
-            zone = "Garden Entry"
-        )
-        val event3 = EventEntity(
-            cameraId = "front_camera",
-            label = "motion",
-            confidence = 1.00f,
-            timestamp = System.currentTimeMillis() - 86400000 - 3600000, // yesterday, 1 hour ago
-            snapshotPath = null,
-            videoPath = videoUrl,
-            zone = "Driveway Zone"
-        )
-        nvrDao.insertEvent(event1)
-        nvrDao.insertEvent(event2)
-        nvrDao.insertEvent(event3)
+        // Events are created at runtime by the NVR service when motion is detected,
+        // with real locally-recorded MP4 clips attached. No mock events are seeded.
     }
 
     private fun triggerTestAlertNotification() {
