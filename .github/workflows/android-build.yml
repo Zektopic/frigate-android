@@ -24,19 +24,23 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # Use the project's Gradle wrapper (8.7) so CI matches local builds and
+      # satisfies AGP 8.5.1 (requires Gradle 8.7+). Do NOT pin an older gradle
+      # version here — that is what made this pipeline fail at setup.
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.2.2'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
       - name: Run Lint Checks
-        run: gradle lintDebug --continue
+        run: ./gradlew lintDebug --continue
 
       - name: Run Unit Tests
-        run: gradle testDebugUnitTest
+        run: ./gradlew testDebugUnitTest
 
       - name: Build Debug APK
-        run: gradle assembleDebug
+        run: ./gradlew assembleDebug
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4

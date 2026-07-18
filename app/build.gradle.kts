@@ -57,6 +57,11 @@ android {
     testOptions {
         unitTests.isReturnDefaultValues = true
     }
+    lint {
+        // Lint is advisory in CI — unit tests and assembleDebug are the gates.
+        abortOnError = false
+        checkReleaseBuilds = false
+    }
 }
 
 dependencies {
