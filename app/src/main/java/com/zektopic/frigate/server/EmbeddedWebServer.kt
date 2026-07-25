@@ -94,6 +94,42 @@ class EmbeddedWebServer(
                             call.respondText(responseHtml, ContentType.Application.Json)
                         }
 
+                        // Diagnostics: per-camera stream state, last decoder error, and
+                        // which H.265 parameter sets were sniffed. Read over `adb forward
+                        // tcp:8080 tcp:8080` then `curl localhost:8080/api/diag` — works
+                        // even where the device suppresses app logcat.
+                        get("/api/diag") {
+                            fun esc(s: String?): String = (s ?: "")
+                                .replace("\\", "\\\\").replace("\"", "\\\"")
+                                .replace("\n", " ").replace("\r", " ")
+                            val cameras = nvrDao.getAllCameraConfigs()
+                            val perCamera = cameras.joinToString(",") { cam ->
+                                val diag = com.zektopic.frigate.media.StreamDiagnostics.byCamera[cam.id]
+                                // Try the camera's configured URL and the last URL it actually used
+                                val sprop = com.zektopic.frigate.media.SpropCache.map[cam.rtspUrl]
+                                    ?: diag?.url?.let { com.zektopic.frigate.media.SpropCache.map[it] }
+                                val captured = sprop?.keys?.sorted() ?: emptyList()
+                                """
+                                {
+                                  "id":"${esc(cam.id)}","name":"${esc(cam.name)}","url":"${esc(cam.rtspUrl)}",
+                                  "resolution":"${cam.detectWidth}x${cam.detectHeight}",
+                                  "state":"${esc(diag?.state ?: "UNKNOWN")}",
+                                  "lastError":"${esc(diag?.lastError)}",
+                                  "spropCaptured":[${captured.joinToString(",") { "\"$it\"" }}],
+                                  "spropCount":${captured.size}
+                                }
+                                """.trimIndent()
+                            }
+                            // Raw dump of every sniffed stream so nothing is missed on URL mismatch
+                            val rawSprop = com.zektopic.frigate.media.SpropCache.map.entries.joinToString(",") { (url, params) ->
+                                "\"${esc(url)}\":[${params.keys.sorted().joinToString(",") { "\"$it\"" }}]"
+                            }
+                            call.respondText(
+                                "{\"cameras\":[$perCamera],\"spropCacheRaw\":{$rawSprop}}",
+                                ContentType.Application.Json
+                            )
+                        }
+
                         // API events listings endpoint
                         get("/api/events") {
                             val events = nvrDao.getPagedEvents(50, 0)

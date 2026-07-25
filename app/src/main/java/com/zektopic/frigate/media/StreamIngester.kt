@@ -72,6 +72,7 @@ class StreamIngester(
         if (currentState == state) return
         currentState = state
         Log.i(tag, "Stream state -> $state")
+        StreamDiagnostics.setState(config.id, currentRtspUrl, state.name)
         onStateChanged(state)
     }
 
@@ -390,6 +391,7 @@ class StreamIngester(
 
                             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                                 Log.e(tag, "ExoPlayer error: ${error.message} (${error.errorCodeName}).")
+                                StreamDiagnostics.setError(config.id, currentRtspUrl, "${error.errorCodeName}: ${error.message}")
                                 mainHandler.post {
                                     if (isIngesting) {
                                         val fallback = getFallbackRtspUrl(currentRtspUrl)
@@ -875,6 +877,33 @@ class StreamIngester(
  */
 object SpropCache {
     val map = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+}
+
+/**
+ * Read-only per-camera stream diagnostics, surfaced by the embedded web server's
+ * /api/diag endpoint. Purely observational — written from StreamIngester's existing
+ * state/error callbacks so we can inspect stuck cameras (e.g. which H.265 parameter
+ * sets were sniffed, the last decoder error) over `adb forward` even on devices that
+ * suppress app logcat.
+ */
+object StreamDiagnostics {
+    data class Entry(
+        @Volatile var state: String = "UNKNOWN",
+        @Volatile var lastError: String? = null,
+        @Volatile var url: String = "",
+        @Volatile var updatedAt: Long = 0L
+    )
+    val byCamera = java.util.concurrent.ConcurrentHashMap<String, Entry>()
+
+    fun setState(cameraId: String, url: String, state: String) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.state = state; e.url = url; e.updatedAt = System.currentTimeMillis()
+    }
+
+    fun setError(cameraId: String, url: String, error: String) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.lastError = error; e.url = url; e.updatedAt = System.currentTimeMillis()
+    }
 }
 
 class RtspInterceptionSocketFactory(
