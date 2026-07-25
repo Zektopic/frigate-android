@@ -263,16 +263,16 @@ class StreamIngester(
                 GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
                 // Create SurfaceTexture from GL texture — owned by this EGL thread
+                //
+                // The buffer size MUST always be set. Leaving it to the decoder was tried
+                // and regressed every H.265 stream on the Qualcomm decoder: with no explicit
+                // size, setOutputSurface fails with "failed to set consumer usage (BAD_INDEX)"
+                // and the camera never reaches LIVE — including at 1920x1080, which the
+                // hardware decoder supports. The detect size is what has always worked here;
+                // the GL pass below renders into a detect-sized FBO regardless, so a larger
+                // consumer buys nothing.
                 val st = SurfaceTexture(texId[0])
-                // Size the consumer to the STREAM, not the detect size. Declaring a
-                // 640x360 buffer for a decoder that produces 2560x1440 is a geometry
-                // mismatch some vendor decoders reject outright. Downscaling still
-                // happens in the GL pass below, whose FBO is detect-sized. When the
-                // geometry is not known yet, leave the default alone and let the
-                // decoder (the producer) dictate it.
-                StreamProfileCache.map[currentRtspUrl]?.let { profile ->
-                    st.setDefaultBufferSize(profile.width, profile.height)
-                }
+                st.setDefaultBufferSize(config.detectWidth, config.detectHeight)
                 val surface = Surface(st)
 
                 // Compile shader program for rendering OES texture to FBO
