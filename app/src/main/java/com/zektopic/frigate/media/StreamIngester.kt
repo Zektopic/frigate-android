@@ -160,6 +160,12 @@ class StreamIngester(
      */
     private fun scheduleReconnect(reason: String) {
         if (!isIngesting) return
+        val fallback = getFallbackRtspUrl(currentRtspUrl)
+        if (fallback != null && !hasAttemptedFallback) {
+            Log.i(tag, "Switching to fallback RTSP URL ($reason): $fallback")
+            hasAttemptedFallback = true
+            currentRtspUrl = fallback
+        }
         stopProducers()
         retryAttempt++
         val delayMs = (2000L shl (retryAttempt - 1).coerceAtMost(5)).coerceAtMost(60_000L)
@@ -944,6 +950,9 @@ class StreamIngester(
             }
             originalUrl.contains("Streaming/Channels/101") -> {
                 originalUrl.replace("Streaming/Channels/101", "Streaming/Channels/102")
+            }
+            !originalUrl.contains("video=") -> {
+                if (originalUrl.contains("?")) "$originalUrl&video=h264" else "$originalUrl?video=h264"
             }
             else -> null
         }
