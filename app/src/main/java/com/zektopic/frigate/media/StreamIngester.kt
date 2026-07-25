@@ -72,6 +72,7 @@ class StreamIngester(
         if (currentState == state) return
         currentState = state
         Log.i(tag, "Stream state -> $state")
+        StreamDiagnostics.setState(config.id, currentRtspUrl, state.name)
         onStateChanged(state)
     }
 
@@ -159,6 +160,12 @@ class StreamIngester(
      */
     private fun scheduleReconnect(reason: String) {
         if (!isIngesting) return
+        val fallback = getFallbackRtspUrl(currentRtspUrl)
+        if (fallback != null && !hasAttemptedFallback) {
+            Log.i(tag, "Switching to fallback RTSP URL ($reason): $fallback")
+            hasAttemptedFallback = true
+            currentRtspUrl = fallback
+        }
         stopProducers()
         retryAttempt++
         val delayMs = (2000L shl (retryAttempt - 1).coerceAtMost(5)).coerceAtMost(60_000L)
@@ -262,6 +269,14 @@ class StreamIngester(
                 GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
                 // Create SurfaceTexture from GL texture — owned by this EGL thread
+                //
+                // The buffer size MUST always be set. Leaving it to the decoder was tried
+                // and regressed every H.265 stream on the Qualcomm decoder: with no explicit
+                // size, setOutputSurface fails with "failed to set consumer usage (BAD_INDEX)"
+                // and the camera never reaches LIVE — including at 1920x1080, which the
+                // hardware decoder supports. The detect size is what has always worked here;
+                // the GL pass below renders into a detect-sized FBO regardless, so a larger
+                // consumer buys nothing.
                 val st = SurfaceTexture(texId[0])
                 st.setDefaultBufferSize(config.detectWidth, config.detectHeight)
                 val surface = Surface(st)
@@ -331,27 +346,25 @@ class StreamIngester(
                         val customSelector = androidx.media3.exoplayer.mediacodec.MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
                             val decoderInfos = androidx.media3.exoplayer.mediacodec.MediaCodecSelector.DEFAULT.getDecoderInfos(
                                 mimeType, requiresSecureDecoder, requiresTunnelingDecoder
-                            ).toMutableList()
-
-                            if (mimeType.equals("video/hevc", ignoreCase = true)) {
-                                // Prefer HARDWARE HEVC decoders: the software decoder
-                                // (c2.android/OMX.google) cannot keep up with 2K+ H.265
-                                // (it inits but never outputs → the stream stalls). The
-                                // earlier hardware-init failures were caused by missing
-                                // sprop parameters, which the SDP injection now supplies,
-                                // so hardware is safe to prefer with software as fallback.
-                                decoderInfos.sortWith(Comparator { codec1, codec2 ->
-                                    val isSw1 = codec1.name.startsWith("OMX.google.", ignoreCase = true) ||
-                                                codec1.name.startsWith("c2.android.", ignoreCase = true)
-                                    val isSw2 = codec2.name.startsWith("OMX.google.", ignoreCase = true) ||
-                                                codec2.name.startsWith("c2.android.", ignoreCase = true)
-                                    if (isSw1 && !isSw2) 1 else if (!isSw1 && isSw2) -1 else 0
-                                })
-                                Log.d(tag, "MediaCodecSelector HEVC decoders (hardware first): ${decoderInfos.map { it.name }}")
+                            )
+                            // Rank video decoders hardware-first across every SoC vendor
+                            // (Snapdragon/MediaTek/Exynos alike), demoting any that cannot
+                            // handle this stream's geometry. Audio and anything else is
+                            // left exactly as media3 ordered it.
+                            if (mimeType.equals("video/hevc", ignoreCase = true) ||
+                                mimeType.equals("video/avc", ignoreCase = true)
+                            ) {
+                                rankVideoDecoders(decoderInfos)
+                            } else {
+                                decoderInfos
                             }
-                            decoderInfos
                         }
 
+                        // Asynchronous MediaCodec queueing is deliberately NOT forced here.
+                        // media3's DefaultMediaCodecAdapterFactory already enables it by
+                        // default on API 31+ (and conditionally on 28-30), so forcing it
+                        // would be a no-op on modern devices and would override media3's
+                        // deliberate exclusion of older ones — untested either way.
                         val renderersFactory = androidx.media3.exoplayer.DefaultRenderersFactory(context)
                             .setMediaCodecSelector(customSelector)
                             .setEnableDecoderFallback(true)
@@ -361,6 +374,21 @@ class StreamIngester(
                         if (isDebuggable) {
                             player.addAnalyticsListener(androidx.media3.exoplayer.util.EventLogger(tag))
                         }
+                        // Record the decoder MediaCodec actually initialized. This is the
+                        // only honest source for "which decoder is running" — the ranking
+                        // is a preference, ExoPlayer's fallback may still pick another.
+                        player.addAnalyticsListener(object : androidx.media3.exoplayer.analytics.AnalyticsListener {
+                            override fun onVideoDecoderInitialized(
+                                eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                                decoderName: String,
+                                initializedTimestampMs: Long,
+                                initializationDurationMs: Long
+                            ) {
+                                Log.i(tag, "Video decoder initialized: $decoderName " +
+                                    "(${DecoderPolicy.vendorOf(decoderName).label}, ${initializationDurationMs}ms)")
+                                StreamDiagnostics.setDecoder(config.id, decoderName)
+                            }
+                        })
                         exoPlayer = player
                         
                         val mediaItem = androidx.media3.common.MediaItem.fromUri(currentRtspUrl)
@@ -375,6 +403,14 @@ class StreamIngester(
                         player.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
                         
                         player.addListener(object : androidx.media3.common.Player.Listener {
+                            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                                // Backstop for StreamProfileCache: covers H.264 and any SPS
+                                // that would not parse. On a reconnect the decoder ranking
+                                // then has real geometry to filter against.
+                                StreamProfileCache.put(currentRtspUrl, videoSize.width, videoSize.height)
+                                StreamDiagnostics.setVideoSize(config.id, videoSize.width, videoSize.height)
+                            }
+
                             override fun onPlaybackStateChanged(playbackState: Int) {
                                 when (playbackState) {
                                     androidx.media3.common.Player.STATE_READY -> {
@@ -390,6 +426,7 @@ class StreamIngester(
 
                             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                                 Log.e(tag, "ExoPlayer error: ${error.message} (${error.errorCodeName}).")
+                                StreamDiagnostics.setError(config.id, currentRtspUrl, "${error.errorCodeName}: ${error.message}")
                                 mainHandler.post {
                                     if (isIngesting) {
                                         val fallback = getFallbackRtspUrl(currentRtspUrl)
@@ -839,6 +876,63 @@ class StreamIngester(
         return shader
     }
 
+    /**
+     * Bridge between media3's decoder infos and the pure [DecoderPolicy].
+     *
+     * Reads media3's own `hardwareAccelerated`/`softwareOnly` flags rather than
+     * matching on decoder names — those flags resolve to the platform APIs on
+     * API 29+ and to media3's name inference below, so one code path covers
+     * Qualcomm, MediaTek and Exynos identically.
+     *
+     * The stream geometry comes from [StreamProfileCache]; when it is not known yet
+     * every candidate reports `supportsSize = null` and nothing is demoted.
+     */
+    private fun rankVideoDecoders(
+        decoderInfos: List<androidx.media3.exoplayer.mediacodec.MediaCodecInfo>
+    ): List<androidx.media3.exoplayer.mediacodec.MediaCodecInfo> {
+        if (decoderInfos.isEmpty()) return decoderInfos
+
+        val profile = StreamProfileCache.map[currentRtspUrl]
+        val byName = decoderInfos.associateBy { it.name }
+
+        val candidates = decoderInfos.map { info ->
+            // Only query size support when we actually know the geometry. A decoder may
+            // support 2560x1440@15 but not @30, so an unknown frame rate stays unknown
+            // rather than being guessed high (which would wrongly demote a working decoder).
+            val supportsSize: Boolean? = if (profile == null) null else try {
+                val rate = if (profile.frameRate > 0.0) profile.frameRate else config.fps.toDouble()
+                info.isVideoSizeAndRateSupportedV21(profile.width, profile.height, rate)
+            } catch (e: Exception) {
+                Log.w(tag, "Could not query size support for ${info.name}: ${e.message}")
+                null
+            }
+            val maxInstances = try {
+                info.maxSupportedInstances
+            } catch (e: Exception) {
+                DecoderCandidate.MAX_INSTANCES_UNKNOWN
+            }
+            DecoderCandidate(
+                name = info.name,
+                hardwareAccelerated = info.hardwareAccelerated,
+                softwareOnly = info.softwareOnly,
+                supportsSize = supportsSize,
+                maxInstances = maxInstances
+            )
+        }
+
+        val ranked = DecoderPolicy.rankCandidates(candidates, DecoderPolicy.deviceVendor())
+        StreamDiagnostics.setCandidates(config.id, ranked)
+        Log.i(
+            tag,
+            "Decoder ranking for ${profile?.let { "${it.width}x${it.height}" } ?: "unknown geometry"}: " +
+                ranked.joinToString(", ") { DecoderPolicy.describe(it) }
+        )
+
+        // Map back to media3 infos, preserving the ranked order. mapNotNull is a
+        // safety net only — every name came from this same list.
+        return ranked.mapNotNull { byName[it.name] }
+    }
+
     private fun getFallbackRtspUrl(originalUrl: String): String? {
         if (originalUrl.isEmpty()) return null
         return when {
@@ -856,6 +950,9 @@ class StreamIngester(
             }
             originalUrl.contains("Streaming/Channels/101") -> {
                 originalUrl.replace("Streaming/Channels/101", "Streaming/Channels/102")
+            }
+            !originalUrl.contains("video=") -> {
+                if (originalUrl.contains("?")) "$originalUrl&video=h264" else "$originalUrl?video=h264"
             }
             else -> null
         }
@@ -875,6 +972,115 @@ class StreamIngester(
  */
 object SpropCache {
     val map = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+}
+
+/**
+ * The real geometry of each stream, keyed by RTSP URL.
+ *
+ * [DecoderPolicy] needs the stream's width/height to ask a decoder whether it can
+ * actually handle it, but media3's `MediaCodecSelector` callback only receives the
+ * MIME type. So the geometry is cached out-of-band here, exactly like [SpropCache]:
+ *
+ *  - filled on the FIRST attempt by parsing the H.265 SPS the SDP interceptor already
+ *    has (from the camera's `a=fmtp`, or sniffed in-band), and
+ *  - backstopped by `onVideoSizeChanged`, which covers H.264 and any SPS that will
+ *    not parse.
+ *
+ * Absent entry means "geometry unknown", which never demotes a decoder — the policy
+ * then falls back to plain hardware-first ranking.
+ */
+object StreamProfileCache {
+    data class VideoProfile(val width: Int, val height: Int, val frameRate: Double = 0.0)
+
+    val map = java.util.concurrent.ConcurrentHashMap<String, VideoProfile>()
+
+    /** Record geometry for [streamKey]. Ignores nonsense values so we never demote on garbage. */
+    fun put(streamKey: String, width: Int, height: Int, frameRate: Double = 0.0) {
+        if (streamKey.isEmpty() || width <= 0 || height <= 0) return
+        val existing = map[streamKey]
+        if (existing != null && existing.width == width && existing.height == height) return
+        map[streamKey] = VideoProfile(width, height, frameRate)
+        Log.i("StreamProfileCache", "Stream geometry for $streamKey: ${width}x$height")
+    }
+
+    /**
+     * Parse an H.265 SPS NAL (raw, no start code) and cache the resolution it declares.
+     * Returns true when the SPS parsed and geometry was recorded.
+     */
+    fun putFromH265Sps(streamKey: String, spsNal: ByteArray): Boolean {
+        // Skip the 2-byte H.265 NAL header — parseH265SpsNalUnitPayload wants the payload,
+        // which is how ExoPlayer's own RtspMediaTrack calls it.
+        if (streamKey.isEmpty() || spsNal.size <= 2) return false
+        return try {
+            val sps = androidx.media3.container.NalUnitUtil
+                .parseH265SpsNalUnitPayload(spsNal, 2, spsNal.size)
+            put(streamKey, sps.width, sps.height)
+            sps.width > 0 && sps.height > 0
+        } catch (e: Exception) {
+            Log.w("StreamProfileCache", "Could not parse H.265 SPS for $streamKey: ${e.message}")
+            false
+        }
+    }
+}
+
+/**
+ * Read-only per-camera stream diagnostics, surfaced by the embedded web server's
+ * /api/diag endpoint. Purely observational — written from StreamIngester's existing
+ * state/error callbacks so we can inspect stuck cameras (e.g. which H.265 parameter
+ * sets were sniffed, which decoder was actually chosen, the last decoder error) over
+ * `adb forward` even on devices that suppress app logcat.
+ */
+object StreamDiagnostics {
+    data class Entry(
+        @Volatile var state: String = "UNKNOWN",
+        @Volatile var lastError: String? = null,
+        @Volatile var url: String = "",
+        @Volatile var updatedAt: Long = 0L,
+        /** Decoder MediaCodec actually initialized, reported by AnalyticsListener. */
+        @Volatile var decoderName: String? = null,
+        @Volatile var decoderVendor: String? = null,
+        @Volatile var hardwareAccelerated: Boolean? = null,
+        /** Every candidate the policy ranked, best-first, with its advertised instance cap. */
+        @Volatile var candidates: List<DecoderCandidate> = emptyList(),
+        @Volatile var videoWidth: Int = 0,
+        @Volatile var videoHeight: Int = 0
+    )
+    val byCamera = java.util.concurrent.ConcurrentHashMap<String, Entry>()
+
+    fun setState(cameraId: String, url: String, state: String) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.state = state; e.url = url; e.updatedAt = System.currentTimeMillis()
+    }
+
+    fun setError(cameraId: String, url: String, error: String) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.lastError = error; e.url = url; e.updatedAt = System.currentTimeMillis()
+    }
+
+    /** The decoder MediaCodec actually initialized — never a guess. */
+    fun setDecoder(cameraId: String, decoderName: String) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.decoderName = decoderName
+        e.decoderVendor = DecoderPolicy.vendorOf(decoderName).label
+        // Prefer the flags media3 gave us for this exact decoder; fall back to null
+        // (unknown) rather than inventing a value from the name.
+        e.hardwareAccelerated = e.candidates.firstOrNull { it.name == decoderName }
+            ?.let { it.hardwareAccelerated && !it.softwareOnly }
+        e.updatedAt = System.currentTimeMillis()
+    }
+
+    /** The ranked candidate list, recorded so /api/diag can show instance caps. */
+    fun setCandidates(cameraId: String, candidates: List<DecoderCandidate>) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.candidates = candidates
+        e.updatedAt = System.currentTimeMillis()
+    }
+
+    fun setVideoSize(cameraId: String, width: Int, height: Int) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.videoWidth = width; e.videoHeight = height
+        e.updatedAt = System.currentTimeMillis()
+    }
 }
 
 class RtspInterceptionSocketFactory(
@@ -1259,6 +1465,11 @@ class RtspInterceptionInputStream(
         if (sniffedParams.containsKey(key)) return
         sniffedParams[key] = java.util.Base64.getEncoder().encodeToString(nal)
         Log.i(tag, "Sniffed in-band $key (${nal.size} bytes) from RTP stream")
+        // The SPS declares the stream's real resolution — cache it so the decoder
+        // ranking can drop decoders that cannot handle this geometry.
+        if (nalType == 33) {
+            StreamProfileCache.putFromH265Sps(streamKey, nal)
+        }
         if (sniffedParams.size == 3) {
             SpropCache.map[streamKey] = sniffedParams.toMap()
             sniffForSprop = false
@@ -1375,6 +1586,19 @@ class RtspInterceptionInputStream(
                                     paramMap[key] = value
                                 } else {
                                     paramMap[pair.trim().lowercase(java.util.Locale.US)] = ""
+                                }
+                            }
+
+                            // The camera supplied its own sprop-sps — parse the real stream
+                            // geometry out of it so the very first connect can already rank
+                            // decoders by whether they support this resolution.
+                            paramMap["sprop-sps"]?.let { spsB64 ->
+                                try {
+                                    StreamProfileCache.putFromH265Sps(
+                                        streamKey, java.util.Base64.getDecoder().decode(spsB64)
+                                    )
+                                } catch (e: Exception) {
+                                    Log.w(tag, "Could not decode SDP sprop-sps: ${e.message}")
                                 }
                             }
 

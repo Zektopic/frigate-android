@@ -93,6 +93,9 @@ dependencies {
     val media3Version = "1.3.1"
     implementation("androidx.media3:media3-exoplayer:$media3Version")
     implementation("androidx.media3:media3-exoplayer-rtsp:$media3Version")
+    // NalUnitUtil — parses the stream's real resolution out of the H.265/H.264 SPS
+    // so DecoderPolicy can drop decoders that cannot handle it (see StreamProfileCache)
+    implementation("androidx.media3:media3-container:$media3Version")
 
     // Room Database for local Events log & Settings
     val roomVersion = "2.6.1"
@@ -120,7 +123,6 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
-    testImplementation("androidx.media3:media3-container:$media3Version")
     testImplementation("org.mockito:mockito-core:5.8.0")
     testImplementation("org.mockito.kotlin:mockito-kotlin:5.2.1")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.0")

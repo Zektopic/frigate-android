@@ -41,6 +41,7 @@ class NvrService : Service(), LifecycleOwner {
     // Motion variables
     private val motionDetectors = mutableMapOf<String, com.zektopic.frigate.ai.MotionDetector>()
     private val lastEventTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val lastFrameProcessTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     // Live Frame flow and cache
     private val latestFramesMap = java.util.concurrent.ConcurrentHashMap<String, Bitmap>()
@@ -248,9 +249,14 @@ class NvrService : Service(), LifecycleOwner {
                         // Feed any in-progress motion recording for this camera
                         clipRecorder.offerFrame(camera.id, frameBitmap)
 
-                        // Route frame through the gated AI pipeline in a background thread
-                        serviceScope.launch(Dispatchers.Default) {
-                            processIncomingFrame(camera.id, frameBitmap)
+                        // Route frame through the gated AI pipeline in a background thread (throttled to 5 FPS per camera max)
+                        val now = System.currentTimeMillis()
+                        val lastProc = lastFrameProcessTime[camera.id] ?: 0L
+                        if (now - lastProc >= 200L) {
+                            lastFrameProcessTime[camera.id] = now
+                            serviceScope.launch(Dispatchers.Default) {
+                                processIncomingFrame(camera.id, frameBitmap)
+                            }
                         }
                     },
                     onStateChanged = { state ->

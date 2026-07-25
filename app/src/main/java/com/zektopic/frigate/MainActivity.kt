@@ -219,7 +219,7 @@ class MainActivity : ComponentActivity() {
               front_camera:
                 ffmpeg:
                   inputs:
-                    - path: rtsp://192.168.1.9:8554/front_camera
+                    - path: rtsp://192.168.1.9:8554/front_camera_h264
                       roles:
                         - detect
                         - record
@@ -261,7 +261,7 @@ class MainActivity : ComponentActivity() {
               stairway_camera:
                 ffmpeg:
                   inputs:
-                    - path: rtsp://192.168.1.9:8554/stairway_camera
+                    - path: rtsp://192.168.1.9:8554/stairway_camera_h264
                       roles:
                         - detect
                         - record
@@ -275,7 +275,7 @@ class MainActivity : ComponentActivity() {
               back_garden:
                 ffmpeg:
                   inputs:
-                    - path: rtsp://192.168.1.9:8554/back_garden
+                    - path: rtsp://192.168.1.9:8554/back_garden_h264
                       roles:
                         - detect
                         - record
@@ -289,7 +289,7 @@ class MainActivity : ComponentActivity() {
               kitchen_camera:
                 ffmpeg:
                   inputs:
-                    - path: rtsp://192.168.1.9:8554/kitchen_camera
+                    - path: rtsp://192.168.1.9:8554/kitchen_camera_h264
                       roles:
                         - detect
                         - record
