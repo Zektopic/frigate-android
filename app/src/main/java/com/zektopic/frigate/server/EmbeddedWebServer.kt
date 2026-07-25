@@ -94,14 +94,19 @@ class EmbeddedWebServer(
                             call.respondText(responseHtml, ContentType.Application.Json)
                         }
 
-                        // Diagnostics: per-camera stream state, last decoder error, and
-                        // which H.265 parameter sets were sniffed. Read over `adb forward
-                        // tcp:8080 tcp:8080` then `curl localhost:8080/api/diag` — works
-                        // even where the device suppresses app logcat.
+                        // Diagnostics: per-camera stream state, last decoder error, which
+                        // H.265 parameter sets were sniffed, and which decoder MediaCodec
+                        // actually initialized (plus every candidate the policy ranked and
+                        // its advertised concurrent-instance cap — the data needed to tell a
+                        // resolution rejection apart from hardware instance exhaustion).
+                        // Read over `adb forward tcp:8080 tcp:8080` then
+                        // `curl localhost:8080/api/diag` — works even where the device
+                        // suppresses app logcat.
                         get("/api/diag") {
                             fun esc(s: String?): String = (s ?: "")
                                 .replace("\\", "\\\\").replace("\"", "\\\"")
                                 .replace("\n", " ").replace("\r", " ")
+                            fun jsonOrNull(s: String?): String = if (s == null) "null" else "\"${esc(s)}\""
                             val cameras = nvrDao.getAllCameraConfigs()
                             val perCamera = cameras.joinToString(",") { cam ->
                                 val diag = com.zektopic.frigate.media.StreamDiagnostics.byCamera[cam.id]
@@ -109,12 +114,25 @@ class EmbeddedWebServer(
                                 val sprop = com.zektopic.frigate.media.SpropCache.map[cam.rtspUrl]
                                     ?: diag?.url?.let { com.zektopic.frigate.media.SpropCache.map[it] }
                                 val captured = sprop?.keys?.sorted() ?: emptyList()
+                                val profile = com.zektopic.frigate.media.StreamProfileCache.map[cam.rtspUrl]
+                                    ?: diag?.url?.let { com.zektopic.frigate.media.StreamProfileCache.map[it] }
+                                val candidates = diag?.candidates.orEmpty().joinToString(",") { c ->
+                                    "{\"name\":\"${esc(c.name)}\",\"vendor\":\"${c.vendor.label}\"," +
+                                        "\"hardware\":${c.hardwareAccelerated && !c.softwareOnly}," +
+                                        "\"supportsSize\":${c.supportsSize ?: "null"}," +
+                                        "\"maxInstances\":${c.maxInstances}}"
+                                }
                                 """
                                 {
                                   "id":"${esc(cam.id)}","name":"${esc(cam.name)}","url":"${esc(cam.rtspUrl)}",
-                                  "resolution":"${cam.detectWidth}x${cam.detectHeight}",
+                                  "detectResolution":"${cam.detectWidth}x${cam.detectHeight}",
+                                  "streamResolution":${jsonOrNull(profile?.let { "${it.width}x${it.height}" })},
                                   "state":"${esc(diag?.state ?: "UNKNOWN")}",
-                                  "lastError":"${esc(diag?.lastError)}",
+                                  "lastError":${jsonOrNull(diag?.lastError)},
+                                  "decoderName":${jsonOrNull(diag?.decoderName)},
+                                  "decoderVendor":${jsonOrNull(diag?.decoderVendor)},
+                                  "hardwareAccelerated":${diag?.hardwareAccelerated ?: "null"},
+                                  "decoderCandidates":[$candidates],
                                   "spropCaptured":[${captured.joinToString(",") { "\"$it\"" }}],
                                   "spropCount":${captured.size}
                                 }
@@ -124,8 +142,13 @@ class EmbeddedWebServer(
                             val rawSprop = com.zektopic.frigate.media.SpropCache.map.entries.joinToString(",") { (url, params) ->
                                 "\"${esc(url)}\":[${params.keys.sorted().joinToString(",") { "\"$it\"" }}]"
                             }
+                            val rawProfiles = com.zektopic.frigate.media.StreamProfileCache.map.entries
+                                .joinToString(",") { (url, p) -> "\"${esc(url)}\":\"${p.width}x${p.height}\"" }
+                            val device = "\"soc\":\"${esc(com.zektopic.frigate.media.DecoderPolicy.deviceVendor().label)}\"," +
+                                "\"model\":\"${esc(android.os.Build.MODEL)}\",\"api\":${android.os.Build.VERSION.SDK_INT}"
                             call.respondText(
-                                "{\"cameras\":[$perCamera],\"spropCacheRaw\":{$rawSprop}}",
+                                "{\"device\":{$device},\"cameras\":[$perCamera]," +
+                                    "\"spropCacheRaw\":{$rawSprop},\"streamProfiles\":{$rawProfiles}}",
                                 ContentType.Application.Json
                             )
                         }

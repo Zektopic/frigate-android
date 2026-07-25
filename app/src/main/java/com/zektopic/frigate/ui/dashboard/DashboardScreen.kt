@@ -1272,6 +1272,9 @@ fun SystemScreen(
     var cpuVal by remember { mutableFloatStateOf(0.0f) }
     var ramVal by remember { mutableFloatStateOf(0.0f) }
     var diskVal by remember { mutableFloatStateOf(0.0f) }
+    // Real decoder actually initialized per camera, read from StreamDiagnostics.
+    // Empty until MediaCodec reports one — never a placeholder or a guess.
+    var decoders by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
 
     // Real device metrics: RAM via ActivityManager, disk via StatFs
     LaunchedEffect(isServiceRunning, cpu) {
@@ -1287,6 +1290,22 @@ fun SystemScreen(
             val stat = android.os.StatFs(context.filesDir.absolutePath)
             val total = stat.totalBytes
             diskVal = if (total > 0) ((total - stat.availableBytes).toDouble() / total).toFloat() else 0.0f
+
+            decoders = if (isServiceRunning) {
+                com.zektopic.frigate.media.StreamDiagnostics.byCamera
+                    .mapNotNull { (id, entry) ->
+                        val name = entry.decoderName ?: return@mapNotNull null
+                        // Strip the vendor prefix — the tail is what identifies the codec
+                        val short = name.substringAfterLast('.', name)
+                        val kind = when (entry.hardwareAccelerated) {
+                            true -> "HW"
+                            false -> "SW"
+                            null -> null
+                        }
+                        id to listOfNotNull(short, kind).joinToString(" · ")
+                    }.toMap()
+            } else emptyMap()
+
             delay(5000)
         }
     }
@@ -1344,6 +1363,7 @@ fun SystemScreen(
                     Text("Detect FPS", modifier = Modifier.weight(0.9f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = TextMuted)
                     Text("Status", modifier = Modifier.weight(0.9f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = TextMuted)
                     Text("Resolution", modifier = Modifier.weight(1.1f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = TextMuted)
+                    Text("Decoder", modifier = Modifier.weight(1.3f), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = TextMuted)
                 }
 
                 if (cameraConfigs.isEmpty()) {
@@ -1376,6 +1396,15 @@ fun SystemScreen(
                                     color = stateColor
                                 )
                                 Text("${camera.detectWidth}x${camera.detectHeight}", modifier = Modifier.weight(1.1f), fontSize = 11.sp, color = TextPrimary)
+                                // Blank until MediaCodec reports a decoder — no placeholder
+                                val decoder = decoders[camera.id]
+                                Text(
+                                    text = decoder ?: "—",
+                                    modifier = Modifier.weight(1.3f),
+                                    fontSize = 11.sp,
+                                    color = if (decoder != null) TextPrimary else TextMuted,
+                                    maxLines = 1
+                                )
                             }
                             Divider(color = SlateBorder.copy(alpha = 0.5f))
                         }
