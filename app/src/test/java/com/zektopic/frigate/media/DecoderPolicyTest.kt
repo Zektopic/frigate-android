@@ -184,6 +184,17 @@ class DecoderPolicyTest {
         assertEquals("c2.qti.avc.decoder", ranked.first().name)
     }
 
+    @Test
+    fun vendorTieBreakIsSkippedWhenTheDeviceSocIsUnknown() {
+        // deviceVendor() returns UNKNOWN on unrecognised SoCs; ranking must then fall
+        // back to media3's original ordering rather than preferring an arbitrary vendor.
+        val input = listOf(hw("c2.mtk.hevc.decoder"), hw("c2.qti.hevc.decoder"))
+        assertEquals(
+            input.map { it.name },
+            DecoderPolicy.rankCandidates(input, DecoderVendor.UNKNOWN).map { it.name }
+        )
+    }
+
     // --- diagnostics ---
 
     @Test

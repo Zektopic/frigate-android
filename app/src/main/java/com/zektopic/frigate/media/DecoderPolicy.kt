@@ -102,8 +102,10 @@ object DecoderPolicy {
         }.lowercase(java.util.Locale.US)
 
         return when {
-            soc.contains("qualcomm") || soc.contains("snapdragon") ||
-                soc.contains("qcom") || soc.contains("kona") || soc.contains("lahaina") -> DecoderVendor.QUALCOMM
+            // "qti" (Qualcomm Technologies Inc) is what SOC_MANUFACTURER reports on
+            // e.g. SM6225/bengal, where ro.hardware is the friendlier "qcom".
+            soc.contains("qualcomm") || soc.contains("snapdragon") || soc.contains("qcom") ||
+                soc.contains("qti") || soc.contains("kona") || soc.contains("lahaina") -> DecoderVendor.QUALCOMM
             soc.contains("mediatek") || soc.contains("mtk") || soc.contains("dimensity") ||
                 soc.contains("helio") -> DecoderVendor.MEDIATEK
             soc.contains("exynos") || soc.contains("samsung") || soc.contains("universal") -> DecoderVendor.EXYNOS
