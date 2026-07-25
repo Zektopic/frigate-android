@@ -354,14 +354,14 @@ class StreamIngester(
                             }
                         }
 
+                        // Asynchronous MediaCodec queueing is deliberately NOT forced here.
+                        // media3's DefaultMediaCodecAdapterFactory already enables it by
+                        // default on API 31+ (and conditionally on 28-30), so forcing it
+                        // would be a no-op on modern devices and would override media3's
+                        // deliberate exclusion of older ones — untested either way.
                         val renderersFactory = androidx.media3.exoplayer.DefaultRenderersFactory(context)
                             .setMediaCodecSelector(customSelector)
                             .setEnableDecoderFallback(true)
-                            // Asynchronous MediaCodec queueing is the mode vendor hardware
-                            // decoders are tuned for (and media3's own default on newer
-                            // releases). Enabling it explicitly also covers the API 26-30
-                            // range this app still supports.
-                            .forceEnableMediaCodecAsynchronousQueueing()
 
                         val player = androidx.media3.exoplayer.ExoPlayer.Builder(context, renderersFactory).build()
                         val isDebuggable = (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
@@ -884,7 +884,7 @@ class StreamIngester(
     private fun rankVideoDecoders(
         decoderInfos: List<androidx.media3.exoplayer.mediacodec.MediaCodecInfo>
     ): List<androidx.media3.exoplayer.mediacodec.MediaCodecInfo> {
-        if (decoderInfos.size < 2) return decoderInfos
+        if (decoderInfos.isEmpty()) return decoderInfos
 
         val profile = StreamProfileCache.map[currentRtspUrl]
         val byName = decoderInfos.associateBy { it.name }
