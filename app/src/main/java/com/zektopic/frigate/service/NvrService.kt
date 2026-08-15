@@ -15,6 +15,7 @@ import com.zektopic.frigate.FrigateApp
 import com.zektopic.frigate.MainActivity
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
+import com.zektopic.frigate.media.DevicePerformance
 import com.zektopic.frigate.media.StreamIngester
 import com.zektopic.frigate.media.StreamState
 import dagger.hilt.android.AndroidEntryPoint
@@ -226,9 +227,21 @@ class NvrService : Service(), LifecycleOwner {
             return
         }
 
-        Log.i(tag, "Camera configs changed. Restarting ${cameras.size} stream(s)...")
+        val budget = DevicePerformance.budget(this)
+        val admitted = cameras.take(budget.maxConcurrentStreams)
+        if (admitted.size < cameras.size) {
+            val dropped = cameras.drop(budget.maxConcurrentStreams).joinToString { it.name }
+            Log.w(
+                tag,
+                "Device budget allows ${budget.maxConcurrentStreams} concurrent streams " +
+                    "(${budget.describe()}); not starting: $dropped"
+            )
+        }
+
+        Log.i(tag, "Camera configs changed. Restarting ${admitted.size} stream(s)...")
         lastCameraConfigSnapshot = cameras.toList()
 
+        val pending = mutableListOf<StreamIngester>()
         synchronized(activeIngesters) {
             // Stop any existing streams first
             for (ingester in activeIngesters.values) {
@@ -240,10 +253,15 @@ class NvrService : Service(), LifecycleOwner {
             // Drop in-flight markers with the ingesters that set them; a stale `true`
             // would permanently gate the new ingester for that camera.
             frameProcessInFlight.clear()
+            // Drop cached frames with the ingesters that produced them. Not recycled:
+            // Compose and the MJPEG endpoint may still be holding one, and a recycled
+            // Bitmap under them is a crash. Releasing the reference is enough to stop
+            // a removed camera's full-resolution frame living for the service's life.
+            latestFramesMap.clear()
             _streamStates.value = emptyMap()
 
             // Initialize new ingesters
-            for (camera in cameras) {
+            for (camera in admitted) {
                 // Initialize a motion detector for this camera with specific thresholds
                 motionDetectors[camera.id] = com.zektopic.frigate.ai.MotionDetector(camera.motionThreshold)
                 cameraById[camera.id] = camera
@@ -284,13 +302,48 @@ class NvrService : Service(), LifecycleOwner {
                     }
                 )
                 activeIngesters[camera.id] = ingester
+                pending += ingester
+            }
+        }
+
+        // Start staggered rather than all at once. Seven simultaneous MediaCodec
+        // configure() calls is what turns "not enough codecs" into "no codecs at all",
+        // and the allocation spike is also what the low-memory killer notices first.
+        serviceScope.launch {
+            pending.forEachIndexed { index, ingester ->
+                if (index > 0) delay(budget.streamStartStaggerMs)
+                // The set can be swapped out from under us by another config change.
+                if (!activeIngesters.containsValue(ingester)) return@forEachIndexed
                 ingester.start()
             }
         }
     }
 
+    /**
+     * Android's warning shot before the low-memory killer. Previously unimplemented,
+     * which meant the app's only response to memory pressure was to be killed - the
+     * observed failure on the Helio G88 tablet, where streams simply stop after a
+     * while. Shedding here is strictly better than dying: a dropped frame cache
+     * rebuilds in one frame, a killed process loses every stream.
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        when {
+            level >= TRIM_MEMORY_RUNNING_CRITICAL -> {
+                Log.w(tag, "Memory critical (level=$level): dropping frame cache and stopping recordings")
+                latestFramesMap.clear()
+                clipRecorder.stopAll()
+            }
+            level >= TRIM_MEMORY_RUNNING_LOW -> {
+                Log.w(tag, "Memory low (level=$level): dropping cached frames")
+                latestFramesMap.clear()
+            }
+        }
+    }
+
     private fun configSignature(c: CameraConfigEntity): String {
-        return "${c.id}|${c.name}|${c.rtspUrl}|${c.isEnabled}|${c.detectWidth}|${c.detectHeight}|${c.fps}|${c.motionThreshold}"
+        return "${c.id}|${c.name}|${c.rtspUrl}|${c.detectRtspUrl}|${c.isEnabled}|" +
+            "${c.detectWidth}|${c.detectHeight}|${c.fps}|${c.motionThreshold}"
     }
 
     private suspend fun processIncomingFrame(cameraId: String, bitmap: android.graphics.Bitmap) {

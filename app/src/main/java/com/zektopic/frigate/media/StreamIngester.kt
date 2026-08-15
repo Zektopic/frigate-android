@@ -57,7 +57,23 @@ class StreamIngester(
     private var exoPlayer: androidx.media3.exoplayer.ExoPlayer? = null
     private var frameExtractionExecutor: ExecutorService? = null
     private val debugFrameCount = java.util.concurrent.atomic.AtomicInteger(0)
-    private var currentRtspUrl: String = config.rtspUrl
+    // Ingest the detect substream when one is configured: this pipeline exists to
+    // produce detect-resolution frames, and decoding the full-resolution feed to do
+    // that is the single largest source of CPU and codec pressure on weak hardware.
+    // Clip recording already encodes from these same frames, so recording quality is
+    // unchanged by this - it was always detect-resolution.
+    private var currentRtspUrl: String = config.effectiveDetectUrl
+    /**
+     * Frame rate actually used, clamped to the device budget and floored at 1.
+     * The floor matters: `fps: 0` in YAML used to divide by zero on the EGL thread,
+     * outside the loop's try, leaking the GL/surface/EGL context and killing the
+     * camera until the service restarted - with no reconnect and no error state.
+     */
+    private val effectiveFps: Int by lazy {
+        val cap = DevicePerformance.budget(context).detectFpsCap
+        config.fps.coerceIn(1, cap)
+    }
+
     private var hasAttemptedFallback = false
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -80,13 +96,13 @@ class StreamIngester(
         if (isIngesting) return
         isIngesting = true
         val myGeneration = generation.incrementAndGet()
-        currentRtspUrl = config.rtspUrl
+        currentRtspUrl = config.effectiveDetectUrl
         hasAttemptedFallback = false
         retryAttempt = 0
         Log.i(tag, "Starting stream ingestion for ${config.name} (gen=$myGeneration)...")
         setState(StreamState.CONNECTING)
 
-        if (config.rtspUrl.isEmpty()) {
+        if (config.effectiveDetectUrl.isEmpty()) {
             // Local physical camera
             startLocalCameraIngestion()
         } else {
@@ -201,7 +217,7 @@ class StreamIngester(
                     .build()
 
                 var lastProcessedTime = 0L
-                val intervalMs = 1000L / config.fps
+                val intervalMs = 1000L / effectiveFps
 
                 imageAnalysis.setAnalyzer(cameraExecutor!!, ImageAnalysis.Analyzer { imageProxy ->
                     val currentTime = System.currentTimeMillis()
@@ -321,12 +337,17 @@ class StreamIngester(
                 val pixelBuffer = ByteBuffer.allocateDirect(config.detectWidth * config.detectHeight * 4)
                     .order(ByteOrder.nativeOrder())
 
-                // Setup vertex data for fullscreen quad
+                // Fullscreen quad as (x, y, u, v). The v coordinates are deliberately
+                // inverted relative to the positions: glReadPixels returns rows
+                // bottom-up, so rendering the texture upside-down here means the
+                // buffer comes out the right way round with no second Bitmap and no
+                // Matrix transform per frame. At 7 cameras x 5fps that flip was
+                // allocating ~32MB/s of ARGB_8888 on its own.
                 val vertexData = floatArrayOf(
-                    -1f, -1f, 0f, 0f,
-                     1f, -1f, 1f, 0f,
-                    -1f,  1f, 0f, 1f,
-                     1f,  1f, 1f, 1f
+                    -1f, -1f, 0f, 1f,
+                     1f, -1f, 1f, 1f,
+                    -1f,  1f, 0f, 0f,
+                     1f,  1f, 1f, 0f
                 )
                 val vertexBuffer = ByteBuffer.allocateDirect(vertexData.size * 4)
                     .order(ByteOrder.nativeOrder())
@@ -498,7 +519,7 @@ class StreamIngester(
                 val stMatrix = FloatArray(16)
                 var lastProcessedTime = 0L
                 var reportedLive = false
-                val intervalMs = 1000L / config.fps
+                val intervalMs = 1000L / effectiveFps
                 val frameAvailable = java.util.concurrent.atomic.AtomicBoolean(false)
 
                 st.setOnFrameAvailableListener({ _ ->
@@ -554,16 +575,11 @@ class StreamIngester(
                         GLES20.glReadPixels(0, 0, config.detectWidth, config.detectHeight,
                             GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixelBuffer)
 
-                        // Convert to Bitmap (glReadPixels gives bottom-up RGBA)
+                        // The quad is rendered v-inverted (see vertexData), so the
+                        // bottom-up rows glReadPixels produces are already correct.
                         pixelBuffer.rewind()
-                        val bitmap = Bitmap.createBitmap(config.detectWidth, config.detectHeight, Bitmap.Config.ARGB_8888)
-                        bitmap.copyPixelsFromBuffer(pixelBuffer)
-
-                        // Flip vertically (GL origin is bottom-left)
-                        val matrix = android.graphics.Matrix()
-                        matrix.preScale(1f, -1f)
-                        val flipped = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, false)
-                        bitmap.recycle()
+                        val frame = Bitmap.createBitmap(config.detectWidth, config.detectHeight, Bitmap.Config.ARGB_8888)
+                        frame.copyPixelsFromBuffer(pixelBuffer)
 
                         lastFrameTime = System.currentTimeMillis()
                         StreamDiagnostics.setLastFrameAt(config.id, lastFrameTime, retryAttempt)
@@ -578,10 +594,10 @@ class StreamIngester(
                         }
                         val frameNumber = debugFrameCount.incrementAndGet()
                         if (frameNumber % 30 == 1) {
-                            val pixel = flipped.getPixel(flipped.width / 2, flipped.height / 2)
-                            Log.d(tag, "Extracted frame #$frameNumber: ${flipped.width}x${flipped.height}, centerPixel=0x${Integer.toHexString(pixel)}")
+                            val pixel = frame.getPixel(frame.width / 2, frame.height / 2)
+                            Log.d(tag, "Extracted frame #$frameNumber: ${frame.width}x${frame.height}, centerPixel=0x${Integer.toHexString(pixel)}")
                         }
-                        onFrameExtracted(flipped)
+                        onFrameExtracted(frame)
 
                     } catch (e: Exception) {
                         Log.e(tag, "Error in frame extraction loop", e)
