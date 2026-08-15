@@ -25,7 +25,7 @@ class YamlConfigParserTest {
               front_camera:
                 ffmpeg:
                   inputs:
-                    - path: rtsp://root:3d9PBN2jqOvE@192.168.1.33/stream=0
+                    - path: rtsp://user:pass@192.168.1.33/stream=0
                       roles:
                         - detect
                         - record
@@ -57,7 +57,7 @@ class YamlConfigParserTest {
         val frontCamera = configs.find { it.id == "front_camera" }
         assertNotNull(frontCamera)
         assertEquals("Front Camera", frontCamera!!.name)
-        assertEquals("rtsp://root:3d9PBN2jqOvE@192.168.1.33/stream=0", frontCamera.rtspUrl)
+        assertEquals("rtsp://user:pass@192.168.1.33/stream=0", frontCamera.rtspUrl)
         assertEquals(640, frontCamera.detectWidth)
         assertEquals(360, frontCamera.detectHeight)
         assertEquals(5, frontCamera.fps)
