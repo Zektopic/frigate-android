@@ -107,6 +107,7 @@ class EmbeddedWebServer(
                                 .replace("\\", "\\\\").replace("\"", "\\\"")
                                 .replace("\n", " ").replace("\r", " ")
                             fun jsonOrNull(s: String?): String = if (s == null) "null" else "\"${esc(s)}\""
+                            val now = System.currentTimeMillis()
                             val cameras = nvrDao.getAllCameraConfigs()
                             val perCamera = cameras.joinToString(",") { cam ->
                                 val diag = com.zektopic.frigate.media.StreamDiagnostics.byCamera[cam.id]
@@ -134,7 +135,12 @@ class EmbeddedWebServer(
                                   "hardwareAccelerated":${diag?.hardwareAccelerated ?: "null"},
                                   "decoderCandidates":[$candidates],
                                   "spropCaptured":[${captured.joinToString(",") { "\"$it\"" }}],
-                                  "spropCount":${captured.size}
+                                  "spropCount":${captured.size},
+                                  "reconnectCount":${diag?.reconnectCount ?: 0},
+                                  "lastReconnectReason":${jsonOrNull(diag?.lastReconnectReason)},
+                                  "lastReconnectAgeMs":${diag?.lastReconnectAt?.takeIf { it > 0L }?.let { now - it } ?: "null"},
+                                  "retryAttempt":${diag?.retryAttempt ?: 0},
+                                  "lastFrameAgeMs":${diag?.lastFrameAt?.takeIf { it > 0L }?.let { now - it } ?: "null"}
                                 }
                                 """.trimIndent()
                             }
@@ -146,8 +152,29 @@ class EmbeddedWebServer(
                                 .joinToString(",") { (url, p) -> "\"${esc(url)}\":\"${p.width}x${p.height}\"" }
                             val device = "\"soc\":\"${esc(com.zektopic.frigate.media.DecoderPolicy.deviceVendor().label)}\"," +
                                 "\"model\":\"${esc(android.os.Build.MODEL)}\",\"api\":${android.os.Build.VERSION.SDK_INT}"
+                            // Process-wide resource accounting. `encodersLeaked` is the
+                            // number that matters over a long run: a leaked encoder is
+                            // unreferenced and cannot be enumerated, so created-minus-
+                            // released is the only way to see it. A non-zero and climbing
+                            // value means the device's global codec pool is draining,
+                            // which eventually stops every decoder too.
+                            val created = com.zektopic.frigate.media.VideoClipEncoder.created.get()
+                            val releasedCount = com.zektopic.frigate.media.VideoClipEncoder.released.get()
+                            val runtime = "\"encodersCreated\":$created," +
+                                "\"encodersReleased\":$releasedCount," +
+                                "\"encodersLeaked\":${created - releasedCount}," +
+                                "\"encoderStartFailures\":${com.zektopic.frigate.media.VideoClipEncoder.startFailures.get()}," +
+                                "\"encoderCapRefusals\":${com.zektopic.frigate.media.ClipRecorder.capRefusals.get()}," +
+                                // /proc/self/task, not Thread.activeCount(): the latter counts
+                                // only the calling thread's ThreadGroup, and this runs on a Netty
+                                // thread while leaked clip-encoder threads are spawned from
+                                // Dispatchers.Default — they would not be counted. This matches
+                                // what `adb shell ps -T` reports.
+                                "\"threads\":${java.io.File("/proc/self/task").list()?.size ?: -1}," +
+                                "\"heapUsedMb\":${(Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1048576}," +
+                                "\"uptimeMs\":${android.os.SystemClock.elapsedRealtime()}"
                             call.respondText(
-                                "{\"device\":{$device},\"cameras\":[$perCamera]," +
+                                "{\"device\":{$device},\"runtime\":{$runtime},\"cameras\":[$perCamera]," +
                                     "\"spropCacheRaw\":{$rawSprop},\"streamProfiles\":{$rawProfiles}}",
                                 ContentType.Application.Json
                             )
