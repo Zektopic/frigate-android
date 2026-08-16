@@ -67,6 +67,13 @@ class ClipRecorder(
 
         /** Cumulative count of recordings skipped because the encoder cap was hit. */
         val capRefusals = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /**
+         * Encoders currently mid-recording. Without this, /api/diag's leak figure
+         * (created - released) counts every in-flight encoder as leaked, so a healthy
+         * device recording two clips reports "2 leaked" - alarming and wrong.
+         */
+        val activeSessions = java.util.concurrent.atomic.AtomicInteger(0)
     }
 
     /** Signal that motion was just detected on this camera — opens or extends a recording. */
@@ -99,6 +106,7 @@ class ClipRecorder(
         }
         lastStartFailureAt.remove(camera.id)
         sessions[camera.id] = Session(encoder, file, now, now)
+        activeSessions.incrementAndGet()
         Log.i(tag, "Started recording clip for ${camera.name}: ${file.name}")
     }
 
@@ -125,6 +133,7 @@ class ClipRecorder(
     @Synchronized
     private fun finishSession(cameraId: String, session: Session): String? {
         if (sessions.remove(cameraId) == null) return null
+        activeSessions.decrementAndGet()
         val ok = try { session.encoder.stop() } finally { encoderPermits.release() }
         return if (ok) {
             Log.i(tag, "Finished clip ${session.file.name} (${session.file.length()} bytes)")

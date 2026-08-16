@@ -168,9 +168,13 @@ class EmbeddedWebServer(
                             // which eventually stops every decoder too.
                             val created = com.zektopic.frigate.media.VideoClipEncoder.created.get()
                             val releasedCount = com.zektopic.frigate.media.VideoClipEncoder.released.get()
+                            val activeEncoders = com.zektopic.frigate.media.ClipRecorder.activeSessions.get()
                             val runtime = "\"encodersCreated\":$created," +
                                 "\"encodersReleased\":$releasedCount," +
-                                "\"encodersLeaked\":${created - releasedCount}," +
+                                "\"encodersActive\":$activeEncoders," +
+                                // Subtract the ones legitimately mid-recording, or a healthy
+                                // device recording two clips reports them as leaked.
+                                "\"encodersLeaked\":${(created - releasedCount - activeEncoders).coerceAtLeast(0)}," +
                                 "\"encoderStartFailures\":${com.zektopic.frigate.media.VideoClipEncoder.startFailures.get()}," +
                                 "\"encoderDrainTimeouts\":${com.zektopic.frigate.media.VideoClipEncoder.drainTimeouts.get()}," +
                                 "\"encoderCapRefusals\":${com.zektopic.frigate.media.ClipRecorder.capRefusals.get()}," +
