@@ -57,7 +57,23 @@ class StreamIngester(
     private var exoPlayer: androidx.media3.exoplayer.ExoPlayer? = null
     private var frameExtractionExecutor: ExecutorService? = null
     private val debugFrameCount = java.util.concurrent.atomic.AtomicInteger(0)
-    private var currentRtspUrl: String = config.rtspUrl
+    // Ingest the detect substream when one is configured: this pipeline exists to
+    // produce detect-resolution frames, and decoding the full-resolution feed to do
+    // that is the single largest source of CPU and codec pressure on weak hardware.
+    // Clip recording already encodes from these same frames, so recording quality is
+    // unchanged by this - it was always detect-resolution.
+    private var currentRtspUrl: String = config.effectiveDetectUrl
+    /**
+     * Frame rate actually used, clamped to the device budget and floored at 1.
+     * The floor matters: `fps: 0` in YAML used to divide by zero on the EGL thread,
+     * outside the loop's try, leaking the GL/surface/EGL context and killing the
+     * camera until the service restarted - with no reconnect and no error state.
+     */
+    private val effectiveFps: Int by lazy {
+        val cap = DevicePerformance.budget(context).detectFpsCap
+        config.fps.coerceIn(1, cap)
+    }
+
     private var hasAttemptedFallback = false
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -80,13 +96,13 @@ class StreamIngester(
         if (isIngesting) return
         isIngesting = true
         val myGeneration = generation.incrementAndGet()
-        currentRtspUrl = config.rtspUrl
+        currentRtspUrl = config.effectiveDetectUrl
         hasAttemptedFallback = false
         retryAttempt = 0
         Log.i(tag, "Starting stream ingestion for ${config.name} (gen=$myGeneration)...")
         setState(StreamState.CONNECTING)
 
-        if (config.rtspUrl.isEmpty()) {
+        if (config.effectiveDetectUrl.isEmpty()) {
             // Local physical camera
             startLocalCameraIngestion()
         } else {
@@ -165,6 +181,15 @@ class StreamIngester(
             Log.i(tag, "Switching to fallback RTSP URL ($reason): $fallback")
             hasAttemptedFallback = true
             currentRtspUrl = fallback
+        } else if (hasAttemptedFallback && currentRtspUrl != config.effectiveDetectUrl) {
+            // The fallback failed too, so it was the wrong guess - go back to the URL
+            // the user actually configured and stay there. The guesses are heuristics
+            // (notably appending ?video=h264, which matches almost any URL), and a
+            // wrong one is not merely useless: go2rtc returns 404 for a codec it has
+            // no source for, so a camera that was working would otherwise retry a
+            // 404 forever, with escalating backoff and no way back.
+            Log.i(tag, "Fallback URL also failed ($reason); reverting to ${config.effectiveDetectUrl}")
+            currentRtspUrl = config.effectiveDetectUrl
         }
         stopProducers()
         retryAttempt++
@@ -201,7 +226,7 @@ class StreamIngester(
                     .build()
 
                 var lastProcessedTime = 0L
-                val intervalMs = 1000L / config.fps
+                val intervalMs = 1000L / effectiveFps
 
                 imageAnalysis.setAnalyzer(cameraExecutor!!, ImageAnalysis.Analyzer { imageProxy ->
                     val currentTime = System.currentTimeMillis()
@@ -321,12 +346,17 @@ class StreamIngester(
                 val pixelBuffer = ByteBuffer.allocateDirect(config.detectWidth * config.detectHeight * 4)
                     .order(ByteOrder.nativeOrder())
 
-                // Setup vertex data for fullscreen quad
+                // Fullscreen quad as (x, y, u, v). The v coordinates are deliberately
+                // inverted relative to the positions: glReadPixels returns rows
+                // bottom-up, so rendering the texture upside-down here means the
+                // buffer comes out the right way round with no second Bitmap and no
+                // Matrix transform per frame. At 7 cameras x 5fps that flip was
+                // allocating ~32MB/s of ARGB_8888 on its own.
                 val vertexData = floatArrayOf(
-                    -1f, -1f, 0f, 0f,
-                     1f, -1f, 1f, 0f,
-                    -1f,  1f, 0f, 1f,
-                     1f,  1f, 1f, 1f
+                    -1f, -1f, 0f, 1f,
+                     1f, -1f, 1f, 1f,
+                    -1f,  1f, 0f, 0f,
+                     1f,  1f, 1f, 0f
                 )
                 val vertexBuffer = ByteBuffer.allocateDirect(vertexData.size * 4)
                     .order(ByteOrder.nativeOrder())
@@ -498,7 +528,7 @@ class StreamIngester(
                 val stMatrix = FloatArray(16)
                 var lastProcessedTime = 0L
                 var reportedLive = false
-                val intervalMs = 1000L / config.fps
+                val intervalMs = 1000L / effectiveFps
                 val frameAvailable = java.util.concurrent.atomic.AtomicBoolean(false)
 
                 st.setOnFrameAvailableListener({ _ ->
@@ -554,16 +584,11 @@ class StreamIngester(
                         GLES20.glReadPixels(0, 0, config.detectWidth, config.detectHeight,
                             GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixelBuffer)
 
-                        // Convert to Bitmap (glReadPixels gives bottom-up RGBA)
+                        // The quad is rendered v-inverted (see vertexData), so the
+                        // bottom-up rows glReadPixels produces are already correct.
                         pixelBuffer.rewind()
-                        val bitmap = Bitmap.createBitmap(config.detectWidth, config.detectHeight, Bitmap.Config.ARGB_8888)
-                        bitmap.copyPixelsFromBuffer(pixelBuffer)
-
-                        // Flip vertically (GL origin is bottom-left)
-                        val matrix = android.graphics.Matrix()
-                        matrix.preScale(1f, -1f)
-                        val flipped = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, false)
-                        bitmap.recycle()
+                        val frame = Bitmap.createBitmap(config.detectWidth, config.detectHeight, Bitmap.Config.ARGB_8888)
+                        frame.copyPixelsFromBuffer(pixelBuffer)
 
                         lastFrameTime = System.currentTimeMillis()
                         StreamDiagnostics.setLastFrameAt(config.id, lastFrameTime, retryAttempt)
@@ -578,10 +603,10 @@ class StreamIngester(
                         }
                         val frameNumber = debugFrameCount.incrementAndGet()
                         if (frameNumber % 30 == 1) {
-                            val pixel = flipped.getPixel(flipped.width / 2, flipped.height / 2)
-                            Log.d(tag, "Extracted frame #$frameNumber: ${flipped.width}x${flipped.height}, centerPixel=0x${Integer.toHexString(pixel)}")
+                            val pixel = frame.getPixel(frame.width / 2, frame.height / 2)
+                            Log.d(tag, "Extracted frame #$frameNumber: ${frame.width}x${frame.height}, centerPixel=0x${Integer.toHexString(pixel)}")
                         }
-                        onFrameExtracted(flipped)
+                        onFrameExtracted(frame)
 
                     } catch (e: Exception) {
                         Log.e(tag, "Error in frame extraction loop", e)
@@ -1232,6 +1257,14 @@ class RtspInterceptionInputStream(
     // VPS/SPS/PPS NALs can be captured into SpropCache (frames pass through
     // unmodified). Cleared once all three are found.
     @Volatile private var sniffForSprop = false
+
+    /**
+     * Which NAL syntax [sniffRtpPacket] should use. H264 has a 1-byte NAL header
+     * (type = b & 0x1F); H265 has 2 bytes (type = (b shr 1) and 0x3F). Reading one
+     * as the other yields plausible-looking garbage rather than an obvious failure,
+     * so this is decided from the SDP rather than guessed per packet.
+     */
+    @Volatile private var sniffingH264 = false
     @Volatile private var seenInterleaved = false
     private val sniffedParams = HashMap<String, String>()
 
@@ -1408,7 +1441,9 @@ class RtspInterceptionInputStream(
                 !SpropCache.map.containsKey(streamKey)
             ) {
                 sniffForSprop = true
-                Log.i(tag, "SDP lacked H.265 sprop parameters; sniffing in-band parameter sets for $streamKey")
+                sniffingH264 = sdpIsH264(sdp)
+                val codec = if (sniffingH264) "H.264" else "H.265"
+                Log.i(tag, "SDP lacked $codec sprop parameters; sniffing in-band parameter sets for $streamKey")
             }
             
             if (modifiedSdp != sdp) {
@@ -1467,6 +1502,26 @@ class RtspInterceptionInputStream(
         }
         if (payloadStart + 2 > length) return
 
+        if (sniffingH264) {
+            // H264: 1-byte NAL header, type in the low 5 bits. 7=SPS, 8=PPS.
+            // STAP-A (24) aggregates several NALUs as [16-bit size][NALU]...
+            when (val nalType = packet[payloadStart].toInt() and 0x1F) {
+                7, 8 -> storeParamSet(nalType, packet.copyOfRange(payloadStart, length))
+                24 -> {
+                    var pos = payloadStart + 1 // 1-byte STAP-A header
+                    while (pos + 2 <= length) {
+                        val size = ((packet[pos].toInt() and 0xFF) shl 8) or (packet[pos + 1].toInt() and 0xFF)
+                        pos += 2
+                        if (size <= 0 || pos + size > length) break
+                        val t = packet[pos].toInt() and 0x1F
+                        if (t == 7 || t == 8) storeParamSet(t, packet.copyOfRange(pos, pos + size))
+                        pos += size
+                    }
+                }
+            }
+            return
+        }
+
         when (val nalType = (packet[payloadStart].toInt() shr 1) and 0x3F) {
             32, 33, 34 -> storeParamSet(nalType, packet.copyOfRange(payloadStart, length))
             48 -> { // aggregation packet: 2-byte AP header, then [16-bit size][NALU]...
@@ -1486,7 +1541,9 @@ class RtspInterceptionInputStream(
     }
 
     private fun storeParamSet(nalType: Int, nal: ByteArray) {
-        val key = when (nalType) {
+        val key = if (sniffingH264) {
+            if (nalType == 7) "h264-sps" else "h264-pps"
+        } else when (nalType) {
             32 -> "sprop-vps"
             33 -> "sprop-sps"
             else -> "sprop-pps"
@@ -1496,13 +1553,16 @@ class RtspInterceptionInputStream(
         Log.i(tag, "Sniffed in-band $key (${nal.size} bytes) from RTP stream")
         // The SPS declares the stream's real resolution — cache it so the decoder
         // ranking can drop decoders that cannot handle this geometry.
-        if (nalType == 33) {
+        if (!sniffingH264 && nalType == 33) {
             StreamProfileCache.putFromH265Sps(streamKey, nal)
         }
-        if (sniffedParams.size == 3) {
+        // H264 needs only SPS+PPS; H265 additionally needs VPS.
+        val required = if (sniffingH264) 2 else 3
+        if (sniffedParams.size == required) {
             SpropCache.map[streamKey] = sniffedParams.toMap()
             sniffForSprop = false
-            Log.i(tag, "All H.265 parameter sets captured for $streamKey; real sprop will be injected on the next connect")
+            val codec = if (sniffingH264) "H.264" else "H.265"
+            Log.i(tag, "All $codec parameter sets captured for $streamKey; real sprop will be injected on the next connect")
         }
     }
 
@@ -1527,12 +1587,117 @@ class RtspInterceptionInputStream(
          */
         internal fun sdpNeedsSpropInjection(sdp: String): Boolean {
             val lower = sdp.lowercase(java.util.Locale.US)
-            return lower.contains("h265") && !lower.contains("sprop-sps")
+            val h265Needs = lower.contains("h265") && !lower.contains("sprop-sps")
+            // go2rtc's transcoded H264 output advertises only
+            // `a=fmtp:96 packetization-mode=1` with no parameter sets, and media3
+            // rejects that outright with "missing sprop parameter". Same treatment
+            // as H265: sniff the real SPS/PPS in-band and inject on reconnect.
+            val h264Needs = lower.contains("h264") && !lower.contains("sprop-parameter-sets")
+            return h265Needs || h264Needs
+        }
+
+        /**
+         * Rewrites a relative `a=control:` attribute to an absolute URL when the stream
+         * URL carries a query string.
+         *
+         * media3 composes the track URL with Uri.appendPath, which inserts the segment
+         * *before* the query: `/back_garden?video=h264` + `trackID=0` becomes
+         * `/back_garden/trackID=0?video=h264`. go2rtc rejects that with SETUP 400 - it
+         * accepts only `/back_garden?video=h264/trackID=0`. Verified against the live
+         * server: the first form returns 400, the second 200.
+         *
+         * An absolute control URL is used verbatim by media3, so emitting one sidesteps
+         * the composition entirely. Only applied when the URL actually has a query, to
+         * leave the ordinary case byte-identical.
+         */
+        internal fun absolutizeControlForQueryUrls(lines: List<String>, baseUrl: String): List<String> {
+            if (!baseUrl.contains('?')) return lines
+            return lines.map { line ->
+                if (!line.startsWith("a=control:")) return@map line
+                val value = line.substring("a=control:".length).trim()
+                if (value.isEmpty() || value == "*" || value.contains("://")) return@map line
+                "a=control:${baseUrl.trimEnd('/')}/$value"
+            }
+        }
+
+        /**
+         * Baseline parameter sets used only to get past media3's DESCRIBE check on the
+         * first connect, so RTP can flow and the real sets can be sniffed. High profile,
+         * level 4.1 - broad enough that most decoders accept the initial configuration,
+         * and replaced by sniffed values on the reconnect either way.
+         */
+        private const val BOOTSTRAP_H264_SPS = "Z2REKaxNAFABa0IAAAMAAgAAAwB4HhEI1A=="
+        private const val BOOTSTRAP_H264_PPS = "aO44gA=="
+
+        /** True when the SDP's video track is H264 rather than H265. */
+        internal fun sdpIsH264(sdp: String): Boolean {
+            val lower = sdp.lowercase(java.util.Locale.US)
+            return lower.contains("h264") && !lower.contains("h265")
+        }
+
+        /**
+         * Adds `sprop-parameter-sets` to an H264 fmtp line when the server omitted it.
+         *
+         * go2rtc's transcoded H264 output advertises only `packetization-mode=1`, and
+         * media3 fails the DESCRIBE outright with "missing sprop parameter" rather than
+         * waiting for in-band parameter sets.
+         *
+         * Real sniffed values are preferred, but something must be injected on the very
+         * first connect or nothing works at all: media3 rejects the DESCRIBE, never
+         * sends PLAY, no RTP flows, and the sniffer has nothing to read - a deadlock
+         * where the stream can never bootstrap itself. So the same tradeoff as the H265
+         * path applies: inject a known-good baseline set to get past the check, let RTP
+         * flow, sniff the real parameters, and reconnect with them. A mismatched initial
+         * SPS costs one reconnect; no SPS costs the camera entirely.
+         */
+        internal fun injectH264SpropIfNeeded(
+            lines: List<String>,
+            tag: String,
+            streamKey: String
+        ): List<String> {
+            val h264Pts = lines.filter {
+                it.startsWith("a=rtpmap:") && it.lowercase(java.util.Locale.US).contains("h264")
+            }.map { it.substring("a=rtpmap:".length).split(" ")[0].trim() }
+            if (h264Pts.isEmpty()) return lines
+
+            val cached = if (streamKey.isNotEmpty()) SpropCache.map[streamKey] else null
+            val sps = cached?.get("h264-sps") ?: BOOTSTRAP_H264_SPS
+            val pps = cached?.get("h264-pps") ?: BOOTSTRAP_H264_PPS
+            if (cached != null) {
+                Log.i(tag, "Using sniffed H.264 parameter sets for $streamKey")
+            } else {
+                Log.i(tag, "No sniffed H.264 parameter sets for $streamKey yet; injecting bootstrap set")
+            }
+
+            val spropParam = "sprop-parameter-sets=$sps,$pps"
+            val out = mutableListOf<String>()
+            val fmtpSeen = mutableSetOf<String>()
+            for (line in lines) {
+                val pt = h264Pts.firstOrNull { line.startsWith("a=fmtp:$it") }
+                if (pt != null) {
+                    fmtpSeen.add(pt)
+                    out.add(
+                        if (line.lowercase(java.util.Locale.US).contains("sprop-parameter-sets")) line
+                        else "$line;$spropParam"
+                    )
+                    Log.i(tag, "Injected sniffed H.264 sprop-parameter-sets for $streamKey (pt=$pt)")
+                } else {
+                    out.add(line)
+                    // A stream with no fmtp line at all still needs one.
+                    val rtpPt = h264Pts.firstOrNull { line.startsWith("a=rtpmap:$it ") }
+                    if (rtpPt != null && lines.none { it.startsWith("a=fmtp:$rtpPt") }) {
+                        out.add("a=fmtp:$rtpPt packetization-mode=1;$spropParam")
+                        fmtpSeen.add(rtpPt)
+                        Log.i(tag, "Injected complete H.264 fmtp line for $streamKey (pt=$rtpPt)")
+                    }
+                }
+            }
+            return out
         }
 
         internal fun maybeModifySdp(sdp: String, tag: String = "RtspInterception", streamKey: String = ""): String {
             // 1. Strip any audio media description blocks
-            val filteredLines = mutableListOf<String>()
+            val rawFilteredLines = mutableListOf<String>()
             var inAudioBlock = false
             val lines = sdp.split("\r\n", "\n")
             for (line in lines) {
@@ -1543,9 +1708,13 @@ class RtspInterceptionInputStream(
                     inAudioBlock = false
                 }
                 if (!inAudioBlock) {
-                    filteredLines.add(line)
+                    rawFilteredLines.add(line)
                 }
             }
+
+            // Applied before either codec branch so both inherit it; neither branch
+            // touches a=control lines.
+            val filteredLines = absolutizeControlForQueryUrls(rawFilteredLines, streamKey)
 
             val h265PayloadTypes = mutableListOf<String>()
             for (line in filteredLines) {
@@ -1556,7 +1725,7 @@ class RtspInterceptionInputStream(
             }
 
             val rawResult = if (h265PayloadTypes.isEmpty()) {
-                filteredLines.joinToString("\r\n")
+                injectH264SpropIfNeeded(filteredLines, tag, streamKey).joinToString("\r\n")
             } else {
                 val fmtpFound = mutableSetOf<String>()
                 val fmtpLines = mutableMapOf<String, String>() // pt -> line

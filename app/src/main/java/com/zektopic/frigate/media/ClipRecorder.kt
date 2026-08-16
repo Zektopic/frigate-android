@@ -41,8 +41,18 @@ class ClipRecorder(
     /** When a camera's encoder last failed to start, so we don't retry it every frame. */
     private val lastStartFailureAt = ConcurrentHashMap<String, Long>()
 
+    /**
+     * Ceiling on simultaneous AVC encoders across every camera, taken from the
+     * device budget rather than a constant: encoders share one codec pool with the
+     * decoders, so the right number on a Helio G88 is not the right number on a
+     * flagship. Cameras beyond the cap skip recording for that event - logged and
+     * counted in [capRefusals] rather than dropped silently.
+     */
+    private val maxConcurrentEncoders: Int =
+        DevicePerformance.budget(context).maxConcurrentEncoders
+
     /** Live encoder permits, bounding concurrent MediaCodec encoders across all cameras. */
-    private val encoderPermits = java.util.concurrent.Semaphore(MAX_CONCURRENT_ENCODERS)
+    private val encoderPermits = java.util.concurrent.Semaphore(maxConcurrentEncoders)
 
     companion object {
         private const val TAIL_MS = 6_000L       // keep recording this long after motion stops
@@ -55,17 +65,15 @@ class ClipRecorder(
          */
         private const val START_FAILURE_COOLDOWN_MS = 30_000L
 
-        /**
-         * Ceiling on simultaneous AVC encoders across every camera. Low-end SoCs
-         * (e.g. Helio G88) share one global codec budget with the decoders, so N
-         * cameras with simultaneous motion must not mean N encoders. Tradeoff:
-         * cameras beyond the cap skip recording for that event — logged and counted
-         * in [capRefusals] rather than dropped silently.
-         */
-        private const val MAX_CONCURRENT_ENCODERS = 2
-
-        /** Cumulative count of recordings skipped because [MAX_CONCURRENT_ENCODERS] was hit. */
+        /** Cumulative count of recordings skipped because the encoder cap was hit. */
         val capRefusals = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /**
+         * Encoders currently mid-recording. Without this, /api/diag's leak figure
+         * (created - released) counts every in-flight encoder as leaked, so a healthy
+         * device recording two clips reports "2 leaked" - alarming and wrong.
+         */
+        val activeSessions = java.util.concurrent.atomic.AtomicInteger(0)
     }
 
     /** Signal that motion was just detected on this camera — opens or extends a recording. */
@@ -82,7 +90,7 @@ class ClipRecorder(
 
         if (!encoderPermits.tryAcquire()) {
             capRefusals.incrementAndGet()
-            Log.w(tag, "Not recording ${camera.name}: already at $MAX_CONCURRENT_ENCODERS concurrent encoders")
+            Log.w(tag, "Not recording ${camera.name}: already at $maxConcurrentEncoders concurrent encoders")
             return
         }
 
@@ -98,6 +106,7 @@ class ClipRecorder(
         }
         lastStartFailureAt.remove(camera.id)
         sessions[camera.id] = Session(encoder, file, now, now)
+        activeSessions.incrementAndGet()
         Log.i(tag, "Started recording clip for ${camera.name}: ${file.name}")
     }
 
@@ -124,6 +133,7 @@ class ClipRecorder(
     @Synchronized
     private fun finishSession(cameraId: String, session: Session): String? {
         if (sessions.remove(cameraId) == null) return null
+        activeSessions.decrementAndGet()
         val ok = try { session.encoder.stop() } finally { encoderPermits.release() }
         return if (ok) {
             Log.i(tag, "Finished clip ${session.file.name} (${session.file.length()} bytes)")

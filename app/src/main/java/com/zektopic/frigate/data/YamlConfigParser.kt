@@ -38,14 +38,34 @@ object YamlConfigParser {
                 .joinToString(" ") { it.replaceFirstChar { char -> char.uppercase() } }
             val name = camMap["name"]?.toString() ?: defaultName
             
-            // Extract RTSP url from ffmpeg configuration
+            // Extract RTSP urls from ffmpeg configuration, honouring Frigate's `roles`.
+            // Previously this took inputs[0] unconditionally and ignored roles entirely,
+            // so a configured low-resolution detect substream was never used and every
+            // camera decoded its full-resolution feed just to produce a detect frame.
             val ffmpegMap = camMap["ffmpeg"] as? Map<*, *>
             val inputs = ffmpegMap?.get("inputs") as? List<*>
-            var rtspUrl = ""
-            if (inputs != null && inputs.isNotEmpty()) {
-                val firstInput = inputs[0] as? Map<*, *>
-                rtspUrl = firstInput?.get("path")?.toString() ?: ""
-            }
+
+            fun pathOf(input: Any?): String =
+                (input as? Map<*, *>)?.get("path")?.toString().orEmpty()
+
+            fun rolesOf(input: Any?): List<String> =
+                ((input as? Map<*, *>)?.get("roles") as? List<*>)
+                    ?.mapNotNull { it?.toString()?.lowercase() }
+                    ?: emptyList()
+
+            val inputList = inputs.orEmpty()
+            // `record` wins for the primary URL, falling back to the first input so
+            // single-input configs (the common case) behave exactly as before.
+            val rtspUrl = inputList.firstOrNull { "record" in rolesOf(it) }?.let { pathOf(it) }
+                ?.takeIf { it.isNotBlank() }
+                ?: pathOf(inputList.firstOrNull())
+
+            // Only treat a detect input as a substream when it is genuinely a different
+            // feed; an input tagged `[detect, record]` is one stream, not two.
+            val detectRtspUrl = inputList.firstOrNull { "detect" in rolesOf(it) }
+                ?.let { pathOf(it) }
+                ?.takeIf { it.isNotBlank() && it != rtspUrl }
+                .orEmpty()
             
             // Extract detect resolution & fps, falling back to global defaults
             val detectMap = camMap["detect"] as? Map<*, *>
@@ -70,6 +90,7 @@ object YamlConfigParser {
                     id = cameraId,
                     name = name,
                     rtspUrl = rtspUrl,
+                    detectRtspUrl = detectRtspUrl,
                     isEnabled = isEnabled,
                     detectWidth = detectWidth,
                     detectHeight = detectHeight,
