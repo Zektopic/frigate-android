@@ -82,6 +82,16 @@ class VideoClipEncoder(
         val created = java.util.concurrent.atomic.AtomicInteger(0)
         val released = java.util.concurrent.atomic.AtomicInteger(0)
         val startFailures = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /** Times the end-of-stream drain hit [DRAIN_TIMEOUT_MS] and abandoned the tail. */
+        val drainTimeouts = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /**
+         * How long to wait for the encoder to flush at end-of-stream. Generous enough
+         * for a healthy codec finishing a GOP, short enough that a wedged one does not
+         * strand the thread (and its codec) for the process lifetime.
+         */
+        private const val DRAIN_TIMEOUT_MS = 2_000L
     }
 
     fun start(): Boolean {
@@ -200,7 +210,19 @@ class VideoClipEncoder(
     private fun drainEncoder(endOfStream: Boolean) {
         val enc = encoder ?: return
         val mux = muxer ?: return
+        // A codec that never emits BUFFER_FLAG_END_OF_STREAM would otherwise spin here
+        // forever. quitSafely() cannot interrupt a Runnable that is already running, so
+        // the thread would never die, releaseAll() would never run, and this encoder's
+        // MediaCodec/Muxer/Surface/EGL context would be held for the life of the
+        // process - draining the device's global codec pool until no camera can decode.
+        // Giving up loses the tail of one clip; not giving up loses every stream.
+        val deadline = System.nanoTime() + DRAIN_TIMEOUT_MS * 1_000_000L
         while (true) {
+            if (endOfStream && System.nanoTime() > deadline) {
+                Log.w(tag, "Encoder drain timed out after ${DRAIN_TIMEOUT_MS}ms; abandoning tail")
+                drainTimeouts.incrementAndGet()
+                return
+            }
             val outIndex = enc.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10_000 else 0)
             when {
                 outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
@@ -212,7 +234,12 @@ class VideoClipEncoder(
                     muxerStarted = true
                 }
                 outIndex >= 0 -> {
-                    val encoded = enc.getOutputBuffer(outIndex) ?: continue
+                    val encoded = enc.getOutputBuffer(outIndex)
+                    if (encoded == null) {
+                        // Still owned by us until released; `continue` here used to leak it.
+                        enc.releaseOutputBuffer(outIndex, false)
+                        continue
+                    }
                     if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                         bufferInfo.size = 0
                     }

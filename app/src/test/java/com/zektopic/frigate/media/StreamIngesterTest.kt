@@ -110,4 +110,146 @@ class StreamIngesterTest {
         assertTrue("Should inject sniffed SPS", reinjected.contains(b64.encodeToString(sps)))
         SpropCache.map.remove(streamKey)
     }
+
+    @Test
+    fun h264SdpWithoutSpropIsFlaggedForInjection() {
+        // Exactly what go2rtc returns for a `?video=h264` transcode; media3 rejects
+        // this with "missing sprop parameter".
+        val sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n" +
+            "a=fmtp:96 packetization-mode=1\r\na=control:trackID=0\r\n"
+        assertTrue(RtspInterceptionInputStream.sdpNeedsSpropInjection(sdp))
+        assertTrue(RtspInterceptionInputStream.sdpIsH264(sdp))
+    }
+
+    @Test
+    fun h264SdpWithSpropIsLeftAlone() {
+        val sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n" +
+            "a=fmtp:96 packetization-mode=1;sprop-parameter-sets=Z0LgHtoBQBbpUA==,aM4wpIA=\r\n"
+        assertFalse(RtspInterceptionInputStream.sdpNeedsSpropInjection(sdp))
+    }
+
+    @Test
+    fun h264SpropIsAppendedToExistingFmtpOnceSniffed() {
+        val streamKey = "rtsp://test-host/h264_stream"
+        SpropCache.map[streamKey] = mapOf("h264-sps" to "AAAA", "h264-pps" to "BBBB")
+        try {
+            val lines = listOf(
+                "m=video 0 RTP/AVP 96",
+                "a=rtpmap:96 H264/90000",
+                "a=fmtp:96 packetization-mode=1",
+                "a=control:trackID=0"
+            )
+            val out = RtspInterceptionInputStream.injectH264SpropIfNeeded(lines, "test", streamKey)
+            val fmtp = out.single { it.startsWith("a=fmtp:96") }
+            assertTrue(fmtp.contains("sprop-parameter-sets=AAAA,BBBB"))
+            assertTrue("must keep the server's own params", fmtp.contains("packetization-mode=1"))
+            assertEquals("no lines added or dropped", lines.size, out.size)
+        } finally {
+            SpropCache.map.remove(streamKey)
+        }
+    }
+
+    @Test
+    fun h264FmtpLineIsCreatedWhenServerSendsNone() {
+        val streamKey = "rtsp://test-host/h264_nofmtp"
+        SpropCache.map[streamKey] = mapOf("h264-sps" to "AAAA", "h264-pps" to "BBBB")
+        try {
+            val lines = listOf("m=video 0 RTP/AVP 96", "a=rtpmap:96 H264/90000", "a=control:trackID=0")
+            val out = RtspInterceptionInputStream.injectH264SpropIfNeeded(lines, "test", streamKey)
+            val fmtp = out.single { it.startsWith("a=fmtp:96") }
+            assertTrue(fmtp.contains("sprop-parameter-sets=AAAA,BBBB"))
+        } finally {
+            SpropCache.map.remove(streamKey)
+        }
+    }
+
+    @Test
+    fun h264BootstrapSpropIsInjectedBeforeAnythingIsSniffed() {
+        // Something must be injected on the first connect or the stream can never
+        // bootstrap: media3 rejects the DESCRIBE, never sends PLAY, no RTP flows, and
+        // the sniffer has nothing to read.
+        val streamKey = "rtsp://test-host/h264_uncached"
+        SpropCache.map.remove(streamKey)
+        val lines = listOf("a=rtpmap:96 H264/90000", "a=fmtp:96 packetization-mode=1")
+        val out = RtspInterceptionInputStream.injectH264SpropIfNeeded(lines, "test", streamKey)
+        val fmtp = out.single { it.startsWith("a=fmtp:96") }
+        assertTrue("bootstrap sprop must be present", fmtp.contains("sprop-parameter-sets="))
+        assertTrue("must keep the server's own params", fmtp.contains("packetization-mode=1"))
+    }
+
+    @Test
+    fun sniffedH264ParametersOverrideTheBootstrapSet() {
+        val streamKey = "rtsp://test-host/h264_override"
+        SpropCache.map[streamKey] = mapOf("h264-sps" to "U05JRkY=", "h264-pps" to "UFBT")
+        try {
+            val lines = listOf("a=rtpmap:96 H264/90000", "a=fmtp:96 packetization-mode=1")
+            val fmtp = RtspInterceptionInputStream
+                .injectH264SpropIfNeeded(lines, "test", streamKey)
+                .single { it.startsWith("a=fmtp:96") }
+            assertTrue(fmtp.contains("sprop-parameter-sets=U05JRkY=,UFBT"))
+        } finally {
+            SpropCache.map.remove(streamKey)
+        }
+    }
+
+    @Test
+    fun controlBecomesAbsoluteWhenTheStreamUrlHasAQuery() {
+        // media3 would otherwise build /back_garden/trackID=0?video=h264, which go2rtc
+        // rejects with SETUP 400; it accepts /back_garden?video=h264/trackID=0.
+        val base = "rtsp://host:8554/back_garden?video=h264"
+        val out = RtspInterceptionInputStream.absolutizeControlForQueryUrls(
+            listOf("a=rtpmap:96 H264/90000", "a=control:trackID=0"), base
+        )
+        assertEquals("a=control:$base/trackID=0", out.last())
+    }
+
+    @Test
+    fun controlIsLeftAloneWithoutAQueryOrWhenAlreadyAbsolute() {
+        val plain = listOf("a=control:trackID=0")
+        assertEquals(plain, RtspInterceptionInputStream
+            .absolutizeControlForQueryUrls(plain, "rtsp://host:8554/back_garden"))
+
+        val absolute = listOf("a=control:rtsp://host:8554/other/trackID=9")
+        assertEquals(absolute, RtspInterceptionInputStream
+            .absolutizeControlForQueryUrls(absolute, "rtsp://host:8554/x?video=h264"))
+
+        val wildcard = listOf("a=control:*")
+        assertEquals(wildcard, RtspInterceptionInputStream
+            .absolutizeControlForQueryUrls(wildcard, "rtsp://host:8554/x?video=h264"))
+    }
+
+    @Test
+    fun h264SniffingReadsSpsAndPpsFromInterleavedRtp() {
+        val streamKey = "rtsp://test-host/h264_sniff"
+        SpropCache.map.remove(streamKey)
+
+        // go2rtc's transcode SDP: H264, packetization-mode only, no parameter sets.
+        val sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n" +
+            "a=fmtp:96 packetization-mode=1\r\na=control:trackID=0\r\n"
+        val sdpBytes = sdp.toByteArray(Charsets.UTF_8)
+        val header = "RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Type: application/sdp\r\n" +
+            "Content-Length: ${sdpBytes.size}\r\n\r\n"
+
+        fun interleaved(nal: ByteArray): ByteArray {
+            val rtp = ByteArray(12).also { it[0] = 0x80.toByte() }
+            val payload = rtp + nal
+            return byteArrayOf(0x24, 0x00, ((payload.size shr 8) and 0xFF).toByte(),
+                (payload.size and 0xFF).toByte()) + payload
+        }
+        // H264 NAL header is one byte; type is the low 5 bits. 7=SPS, 8=PPS.
+        val sps = byteArrayOf(0x67, 0x64, 0x00, 0x29, 0x11, 0x22)
+        val pps = byteArrayOf(0x68, 0xEE.toByte(), 0x38, 0x80.toByte())
+
+        val wire = header.toByteArray(Charsets.UTF_8) + sdpBytes + interleaved(sps) + interleaved(pps)
+        val input = RtspInterceptionInputStream(java.io.ByteArrayInputStream(wire), "test", streamKey)
+        val buf = ByteArray(1024)
+        while (input.read(buf, 0, buf.size) > 0) { /* drain */ }
+
+        val cached = SpropCache.map[streamKey]
+        assertNotNull("H264 sniffer should cache SPS and PPS", cached)
+        val b64 = java.util.Base64.getEncoder()
+        assertEquals(b64.encodeToString(sps), cached!!["h264-sps"])
+        assertEquals(b64.encodeToString(pps), cached["h264-pps"])
+        SpropCache.map.remove(streamKey)
+    }
 }

@@ -72,4 +72,69 @@ class YamlConfigParserTest {
         assertEquals(5, workCamera.fps)
         assertEquals(0.5f, workCamera.recordingRetentionDays)
     }
+
+    @Test
+    fun detectRoleSelectsSubstreamAndRecordRoleSelectsMainFeed() {
+        val configs = YamlConfigParser.parseConfig(
+            """
+            cameras:
+              front_camera:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://host:8554/front_sub
+                      roles:
+                        - detect
+                    - path: rtsp://host:8554/front_main
+                      roles:
+                        - record
+            """.trimIndent()
+        )
+
+        val cam = configs.single()
+        assertEquals("rtsp://host:8554/front_main", cam.rtspUrl)
+        assertEquals("rtsp://host:8554/front_sub", cam.detectRtspUrl)
+        assertEquals("rtsp://host:8554/front_sub", cam.effectiveDetectUrl)
+    }
+
+    @Test
+    fun singleInputWithBothRolesIsNotTreatedAsASubstream() {
+        // One feed tagged [detect, record] is one stream. Recording a detectRtspUrl
+        // here would imply a second stream that does not exist.
+        val configs = YamlConfigParser.parseConfig(
+            """
+            cameras:
+              front_camera:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://host:8554/only
+                      roles:
+                        - detect
+                        - record
+            """.trimIndent()
+        )
+
+        val cam = configs.single()
+        assertEquals("rtsp://host:8554/only", cam.rtspUrl)
+        assertEquals("", cam.detectRtspUrl)
+        assertEquals("rtsp://host:8554/only", cam.effectiveDetectUrl)
+    }
+
+    @Test
+    fun inputWithoutRolesStillResolvesToFirstInput() {
+        // The pre-existing single-input shape must keep behaving exactly as before.
+        val configs = YamlConfigParser.parseConfig(
+            """
+            cameras:
+              front_camera:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://host:8554/plain
+            """.trimIndent()
+        )
+
+        val cam = configs.single()
+        assertEquals("rtsp://host:8554/plain", cam.rtspUrl)
+        assertEquals("", cam.detectRtspUrl)
+        assertEquals("rtsp://host:8554/plain", cam.effectiveDetectUrl)
+    }
 }

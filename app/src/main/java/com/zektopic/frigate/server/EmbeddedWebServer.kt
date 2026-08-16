@@ -150,8 +150,16 @@ class EmbeddedWebServer(
                             }
                             val rawProfiles = com.zektopic.frigate.media.StreamProfileCache.map.entries
                                 .joinToString(",") { (url, p) -> "\"${esc(url)}\":\"${p.width}x${p.height}\"" }
+                            val budget = com.zektopic.frigate.media.DevicePerformance.cachedBudget()
+                            val budgetJson = if (budget == null) "null" else
+                                "{\"tier\":\"${budget.tier}\",\"maxStreams\":${budget.maxConcurrentStreams}," +
+                                    "\"maxEncoders\":${budget.maxConcurrentEncoders}," +
+                                    "\"detectFpsCap\":${budget.detectFpsCap}," +
+                                    "\"decoderInstances\":${budget.reportedDecoderInstances}," +
+                                    "\"ramMb\":${budget.totalRamMb},\"cores\":${budget.cores}}"
                             val device = "\"soc\":\"${esc(com.zektopic.frigate.media.DecoderPolicy.deviceVendor().label)}\"," +
-                                "\"model\":\"${esc(android.os.Build.MODEL)}\",\"api\":${android.os.Build.VERSION.SDK_INT}"
+                                "\"model\":\"${esc(android.os.Build.MODEL)}\",\"api\":${android.os.Build.VERSION.SDK_INT}," +
+                                "\"budget\":$budgetJson"
                             // Process-wide resource accounting. `encodersLeaked` is the
                             // number that matters over a long run: a leaked encoder is
                             // unreferenced and cannot be enumerated, so created-minus-
@@ -160,10 +168,15 @@ class EmbeddedWebServer(
                             // which eventually stops every decoder too.
                             val created = com.zektopic.frigate.media.VideoClipEncoder.created.get()
                             val releasedCount = com.zektopic.frigate.media.VideoClipEncoder.released.get()
+                            val activeEncoders = com.zektopic.frigate.media.ClipRecorder.activeSessions.get()
                             val runtime = "\"encodersCreated\":$created," +
                                 "\"encodersReleased\":$releasedCount," +
-                                "\"encodersLeaked\":${created - releasedCount}," +
+                                "\"encodersActive\":$activeEncoders," +
+                                // Subtract the ones legitimately mid-recording, or a healthy
+                                // device recording two clips reports them as leaked.
+                                "\"encodersLeaked\":${(created - releasedCount - activeEncoders).coerceAtLeast(0)}," +
                                 "\"encoderStartFailures\":${com.zektopic.frigate.media.VideoClipEncoder.startFailures.get()}," +
+                                "\"encoderDrainTimeouts\":${com.zektopic.frigate.media.VideoClipEncoder.drainTimeouts.get()}," +
                                 "\"encoderCapRefusals\":${com.zektopic.frigate.media.ClipRecorder.capRefusals.get()}," +
                                 // /proc/self/task, not Thread.activeCount(): the latter counts
                                 // only the calling thread's ThreadGroup, and this runs on a Netty
