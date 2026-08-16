@@ -28,7 +28,9 @@ Thumbs.db
 *.bin
 
 # Debug/dev artifacts
-logcat*.txt
+# Leading wildcard is deliberate: `logcat*.txt` missed the app_-prefixed dumps
+# (app_logcat.txt was tracked for months as a result).
+*logcat*.txt
 screencap*.png
 *.sqlite
 db.sqlite

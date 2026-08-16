@@ -36,9 +36,11 @@ class VideoClipEncoder(
 ) {
     private val tag = "VideoClipEncoder"
 
-    private lateinit var encoder: MediaCodec
-    private lateinit var inputSurface: Surface
-    private lateinit var muxer: MediaMuxer
+    // Nullable rather than lateinit: [releaseAll] must be safe to call on a
+    // partially-constructed encoder (any of these can fail to allocate).
+    private var encoder: MediaCodec? = null
+    private var inputSurface: Surface? = null
+    private var muxer: MediaMuxer? = null
     private var trackIndex = -1
     private var muxerStarted = false
     private val bufferInfo = MediaCodec.BufferInfo()
@@ -49,7 +51,7 @@ class VideoClipEncoder(
     private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
     private var program = 0
     private var textureId = 0
-    private lateinit var vertexBuffer: java.nio.FloatBuffer
+    private var vertexBuffer: java.nio.FloatBuffer? = null
 
     private val thread = HandlerThread("clip-encoder-${outputFile.name}").apply { start() }
     private val handler = android.os.Handler(thread.looper)
@@ -57,6 +59,30 @@ class VideoClipEncoder(
     @Volatile private var started = false
     @Volatile private var frameCount = 0
     private var startPtsNanos = 0L
+
+    /** Set when [start] gives up waiting; the setup block releases instead of publishing. */
+    @Volatile private var abandoned = false
+
+    /** Guards [releaseAll] so native resources are freed — and counted — exactly once. */
+    private val releaseRecorded = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    init {
+        // Counted here, not in start(): the HandlerThread above is already running,
+        // so an instance that is constructed and then dropped is itself a leak.
+        created.incrementAndGet()
+    }
+
+    companion object {
+        /**
+         * Cumulative encoder lifetime counters, surfaced by /api/diag. A leaked
+         * encoder is by definition unreferenced and cannot be enumerated, so the
+         * ([created] - [released]) delta *is* the leak; a count of live sessions
+         * would report healthy while the device's codec pool drains.
+         */
+        val created = java.util.concurrent.atomic.AtomicInteger(0)
+        val released = java.util.concurrent.atomic.AtomicInteger(0)
+        val startFailures = java.util.concurrent.atomic.AtomicInteger(0)
+    }
 
     fun start(): Boolean {
         val result = java.util.concurrent.CompletableFuture<Boolean>()
@@ -69,22 +95,46 @@ class VideoClipEncoder(
                     setInteger(MediaFormat.KEY_FRAME_RATE, fps.coerceAtLeast(1))
                     setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 }
-                encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                inputSurface = encoder.createInputSurface()
-                encoder.start()
+                val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                encoder = codec
+                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                inputSurface = codec.createInputSurface()
+                codec.start()
 
                 muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
                 setupEgl()
                 setupGl()
+                if (abandoned) {
+                    // The caller already gave up on us; never publish, just release.
+                    Log.w(tag, "Encoder setup completed after start() timed out; releasing")
+                    releaseAll()
+                    result.complete(false)
+                    return@post
+                }
                 started = true
                 result.complete(true)
             } catch (e: Exception) {
                 Log.e(tag, "Failed to start encoder", e)
+                releaseAll()
                 result.complete(false)
             }
         }
-        return try { result.get(3, java.util.concurrent.TimeUnit.SECONDS) } catch (e: Exception) { false }
+        val ok = try {
+            result.get(3, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            // Timed out (or interrupted). The posted block may not have run yet, so a
+            // flag check inside it is not sufficient on its own — queue the cleanup so
+            // the Handler's FIFO ordering guarantees it lands after setup, whenever
+            // that is. quitSafely() below still delivers already-queued messages.
+            abandoned = true
+            handler.post { if (started) { releaseAll(); started = false } }
+            false
+        }
+        if (!ok) {
+            startFailures.incrementAndGet()
+            quitThread()
+        }
+        return ok
     }
 
     /** Queue a frame for encoding. The bitmap is read on the encoder thread; do not recycle it before this returns. */
@@ -117,13 +167,19 @@ class VideoClipEncoder(
 
     /** Finalize the MP4. Returns true if a playable file with at least one frame was written. */
     fun stop(): Boolean {
-        if (!started) { quitThread(); return false }
+        if (!started) {
+            // Never published, or already torn down. releaseAll is idempotent, but it
+            // must run on the encoder thread, so post it ahead of quitSafely().
+            handler.post { releaseAll() }
+            quitThread()
+            return false
+        }
         val result = java.util.concurrent.CompletableFuture<Boolean>()
         handler.post {
             var ok = false
             try {
                 if (frameCount > 0) {
-                    encoder.signalEndOfInputStream()
+                    encoder?.signalEndOfInputStream()
                     drainEncoder(true)
                     ok = muxerStarted
                 }
@@ -142,28 +198,30 @@ class VideoClipEncoder(
 
     // --- encoder drain ---
     private fun drainEncoder(endOfStream: Boolean) {
+        val enc = encoder ?: return
+        val mux = muxer ?: return
         while (true) {
-            val outIndex = encoder.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10_000 else 0)
+            val outIndex = enc.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10_000 else 0)
             when {
                 outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     if (!endOfStream) return
                 }
                 outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    trackIndex = muxer.addTrack(encoder.outputFormat)
-                    muxer.start()
+                    trackIndex = mux.addTrack(enc.outputFormat)
+                    mux.start()
                     muxerStarted = true
                 }
                 outIndex >= 0 -> {
-                    val encoded = encoder.getOutputBuffer(outIndex) ?: continue
+                    val encoded = enc.getOutputBuffer(outIndex) ?: continue
                     if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                         bufferInfo.size = 0
                     }
                     if (bufferInfo.size > 0 && muxerStarted) {
                         encoded.position(bufferInfo.offset)
                         encoded.limit(bufferInfo.offset + bufferInfo.size)
-                        muxer.writeSampleData(trackIndex, encoded, bufferInfo)
+                        mux.writeSampleData(trackIndex, encoded, bufferInfo)
                     }
-                    encoder.releaseOutputBuffer(outIndex, false)
+                    enc.releaseOutputBuffer(outIndex, false)
                     if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
                 }
             }
@@ -172,6 +230,7 @@ class VideoClipEncoder(
 
     // --- EGL / GL helpers ---
     private fun setupEgl() {
+        val surface = inputSurface ?: throw IllegalStateException("no encoder input surface")
         eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         val version = IntArray(2)
         EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
@@ -186,7 +245,7 @@ class VideoClipEncoder(
         val ctxAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
         eglContext = EGL14.eglCreateContext(eglDisplay, configs[0], EGL14.EGL_NO_CONTEXT, ctxAttribs, 0)
         val surfAttribs = intArrayOf(EGL14.EGL_NONE)
-        eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], inputSurface, surfAttribs, 0)
+        eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], surface, surfAttribs, 0)
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
     }
 
@@ -226,14 +285,15 @@ class VideoClipEncoder(
     }
 
     private fun drawQuad() {
+        val verts = vertexBuffer ?: return
         val posLoc = GLES20.glGetAttribLocation(program, "aPos")
         val texLoc = GLES20.glGetAttribLocation(program, "aTex")
-        vertexBuffer.position(0)
+        verts.position(0)
         GLES20.glEnableVertexAttribArray(posLoc)
-        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
-        vertexBuffer.position(2)
+        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, verts)
+        verts.position(2)
         GLES20.glEnableVertexAttribArray(texLoc)
-        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 16, verts)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uTex"), 0)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
@@ -245,12 +305,20 @@ class VideoClipEncoder(
         return s
     }
 
+    /**
+     * Frees every native resource this encoder holds. Idempotent, safe on a
+     * partially-constructed encoder, and must run on the encoder thread (it tears
+     * down the EGL context that was made current there). Failures are logged rather
+     * than swallowed — a codec that refuses to release is exactly the condition that
+     * drains the device's global codec pool, and it must leave a trace.
+     */
     private fun releaseAll() {
-        try { if (muxerStarted) muxer.stop() } catch (e: Exception) {}
-        try { muxer.release() } catch (e: Exception) {}
-        try { encoder.stop() } catch (e: Exception) {}
-        try { encoder.release() } catch (e: Exception) {}
-        try { inputSurface.release() } catch (e: Exception) {}
+        if (!releaseRecorded.compareAndSet(false, true)) return
+        try { if (muxerStarted) muxer?.stop() } catch (e: Exception) { Log.w(tag, "muxer.stop failed", e) }
+        try { muxer?.release() } catch (e: Exception) { Log.w(tag, "muxer.release failed", e) }
+        try { encoder?.stop() } catch (e: Exception) { Log.w(tag, "encoder.stop failed", e) }
+        try { encoder?.release() } catch (e: Exception) { Log.w(tag, "encoder.release failed", e) }
+        try { inputSurface?.release() } catch (e: Exception) { Log.w(tag, "inputSurface.release failed", e) }
         try {
             if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
                 EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
@@ -258,7 +326,15 @@ class VideoClipEncoder(
                 EGL14.eglDestroyContext(eglDisplay, eglContext)
                 EGL14.eglTerminate(eglDisplay)
             }
-        } catch (e: Exception) {}
+        } catch (e: Exception) { Log.w(tag, "EGL teardown failed", e) }
+        muxer = null
+        encoder = null
+        inputSurface = null
+        vertexBuffer = null
+        eglDisplay = EGL14.EGL_NO_DISPLAY
+        eglContext = EGL14.EGL_NO_CONTEXT
+        eglSurface = EGL14.EGL_NO_SURFACE
+        released.incrementAndGet()
     }
 
     private fun quitThread() {

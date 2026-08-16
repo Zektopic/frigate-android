@@ -170,6 +170,7 @@ class StreamIngester(
         retryAttempt++
         val delayMs = (2000L shl (retryAttempt - 1).coerceAtMost(5)).coerceAtMost(60_000L)
         setState(if (retryAttempt >= 3) StreamState.OFFLINE else StreamState.RETRYING)
+        StreamDiagnostics.recordReconnect(config.id, reason, retryAttempt)
         Log.w(tag, "Stream down ($reason). Reconnect attempt #$retryAttempt in ${delayMs}ms")
         val r = Runnable {
             if (isIngesting) {
@@ -565,6 +566,7 @@ class StreamIngester(
                         bitmap.recycle()
 
                         lastFrameTime = System.currentTimeMillis()
+                        StreamDiagnostics.setLastFrameAt(config.id, lastFrameTime, retryAttempt)
                         if (!reportedLive) {
                             reportedLive = true
                             mainHandler.post {
@@ -1043,9 +1045,36 @@ object StreamDiagnostics {
         /** Every candidate the policy ranked, best-first, with its advertised instance cap. */
         @Volatile var candidates: List<DecoderCandidate> = emptyList(),
         @Volatile var videoWidth: Int = 0,
-        @Volatile var videoHeight: Int = 0
+        @Volatile var videoHeight: Int = 0,
+        /**
+         * Cumulative reconnect count and the last reason. Last-values alone can't
+         * distinguish a stream that reconnected once from one thrashing hourly,
+         * which is the whole question on a multi-hour run.
+         */
+        @Volatile var reconnectCount: Int = 0,
+        @Volatile var lastReconnectReason: String? = null,
+        @Volatile var lastReconnectAt: Long = 0L,
+        /** Current backoff attempt; 0 once a live frame has arrived. */
+        @Volatile var retryAttempt: Int = 0,
+        /** Wall-clock time of the last extracted frame, so /api/diag can show its age. */
+        @Volatile var lastFrameAt: Long = 0L
     )
     val byCamera = java.util.concurrent.ConcurrentHashMap<String, Entry>()
+
+    fun recordReconnect(cameraId: String, reason: String, attempt: Int) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.reconnectCount++
+        e.lastReconnectReason = reason
+        e.lastReconnectAt = System.currentTimeMillis()
+        e.retryAttempt = attempt
+        e.updatedAt = e.lastReconnectAt
+    }
+
+    fun setLastFrameAt(cameraId: String, at: Long, retryAttempt: Int) {
+        val e = byCamera.getOrPut(cameraId) { Entry() }
+        e.lastFrameAt = at
+        e.retryAttempt = retryAttempt
+    }
 
     fun setState(cameraId: String, url: String, state: String) {
         val e = byCamera.getOrPut(cameraId) { Entry() }

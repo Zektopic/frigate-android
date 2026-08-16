@@ -43,6 +43,13 @@ class NvrService : Service(), LifecycleOwner {
     private val lastEventTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val lastFrameProcessTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
+    // Per-camera in-flight guard for the AI pipeline. The time throttle below limits
+    // dispatch rate, not completion, so a slow frame would otherwise keep queueing
+    // coroutines (each retaining a detect-resolution bitmap) on Dispatchers.Default.
+    // Drop the new frame instead — same policy as _frameFlow's DROP_OLDEST.
+    private val frameProcessInFlight =
+        java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
+
     // Live Frame flow and cache
     private val latestFramesMap = java.util.concurrent.ConcurrentHashMap<String, Bitmap>()
     private val _frameFlow = MutableSharedFlow<Pair<String, Bitmap>>(
@@ -230,6 +237,9 @@ class NvrService : Service(), LifecycleOwner {
             activeIngesters.clear()
             motionDetectors.clear()
             cameraById.clear()
+            // Drop in-flight markers with the ingesters that set them; a stale `true`
+            // would permanently gate the new ingester for that camera.
+            frameProcessInFlight.clear()
             _streamStates.value = emptyMap()
 
             // Initialize new ingesters
@@ -249,13 +259,23 @@ class NvrService : Service(), LifecycleOwner {
                         // Feed any in-progress motion recording for this camera
                         clipRecorder.offerFrame(camera.id, frameBitmap)
 
-                        // Route frame through the gated AI pipeline in a background thread (throttled to 5 FPS per camera max)
+                        // Route frame through the gated AI pipeline in a background thread
+                        // (throttled to 5 FPS per camera max, and at most one in flight)
                         val now = System.currentTimeMillis()
                         val lastProc = lastFrameProcessTime[camera.id] ?: 0L
                         if (now - lastProc >= 200L) {
-                            lastFrameProcessTime[camera.id] = now
-                            serviceScope.launch(Dispatchers.Default) {
-                                processIncomingFrame(camera.id, frameBitmap)
+                            val inFlight = frameProcessInFlight.getOrPut(camera.id) {
+                                java.util.concurrent.atomic.AtomicBoolean(false)
+                            }
+                            if (inFlight.compareAndSet(false, true)) {
+                                lastFrameProcessTime[camera.id] = now
+                                serviceScope.launch(Dispatchers.Default) {
+                                    try {
+                                        processIncomingFrame(camera.id, frameBitmap)
+                                    } finally {
+                                        inFlight.set(false)
+                                    }
+                                }
                             }
                         }
                     },
