@@ -438,7 +438,11 @@ fun AboutSection(
     val configVersion = remember(configYaml) {
         Regex("(?m)^version:\\s*(.+)$").find(configYaml)?.groupValues?.get(1)?.trim() ?: "—"
     }
-    val storagePath = remember { RecordingStore(context).displayLocation() }
+    val store = remember { RecordingStore(context) }
+    // Read on every composition, not remembered: the destination can change in the
+    // Storage section right above this one, and a pinned value would keep showing the
+    // old folder. The call is prefs plus string work, no disk I/O.
+    val storagePath = store.displayLocation()
 
     SettingsSectionCard("About", Icons.Default.Info) {
         AboutRow("App version", versionName)
