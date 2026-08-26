@@ -60,7 +60,7 @@ decoder, negotiated resolution and connection health.
 - **Camera wizard** — 3-step add/edit/delete with a live RTSP connection test (`DESCRIBE` probe reporting reachability and codec)
 - **Global configuration** — MQTT host/port, detection defaults, tracked objects
 - **Notifications** — master switch, alert-on-motion, per-camera mute, backed by DataStore and enforced by the service
-- **Storage** — recording count, on-disk size, and bulk delete
+- **Storage** — recording count, on-disk size, free space, bulk delete, and a folder picker that sends recordings anywhere the device can write, SD cards and USB drives included
 - **Advanced** — raw YAML editor for the full Frigate-style config
 
 ---
@@ -257,6 +257,7 @@ app/src/main/java/com/zektopic/frigate/
 │   ├── DecoderPolicy.kt               # vendor-aware decoder ranking
 │   ├── ClipRecorder.kt                # motion-triggered recording sessions
 │   └── VideoClipEncoder.kt            # MediaCodec AVC + EGL MP4 encoder
+├── data/RecordingStore.kt             # recording destination (default dir or SAF tree) + reads
 ├── ui/
 │   ├── dashboard/DashboardScreen.kt   # Live · Review · System · Settings
 │   ├── settings/                      # camera wizard, YAML editor, settings sections

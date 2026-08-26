@@ -27,6 +27,7 @@ class EmbeddedWebServer(
     private val port: Int = 8080
 ) {
     private val tag = "EmbeddedWebServer"
+    private val recordingStore = com.zektopic.frigate.data.RecordingStore(context)
     private var server: NettyApplicationEngine? = null
     private val serverScope = CoroutineScope(Dispatchers.IO)
 
@@ -223,9 +224,13 @@ class EmbeddedWebServer(
                             val matchingEvent = events.find { it.id == eventId }
                             
                             if (matchingEvent?.snapshotPath != null) {
-                                val file = File(matchingEvent.snapshotPath)
-                                if (file.exists()) {
-                                    call.respondFile(file)
+                                // Snapshots may live in a user-chosen folder (SD card, USB),
+                                // where they are document URIs rather than files — read them
+                                // through the store so both forms are served.
+                                val bytes = recordingStore.openInput(matchingEvent.snapshotPath)
+                                    ?.use { it.readBytes() }
+                                if (bytes != null) {
+                                    call.respondBytes(bytes, ContentType.Image.JPEG)
                                 } else {
                                     call.respond(HttpStatusCode.NotFound, "Snapshot file not found on disk")
                                 }

@@ -48,8 +48,10 @@ import com.zektopic.frigate.media.StreamState
 import com.zektopic.frigate.ui.settings.CameraFeatures
 import com.zektopic.frigate.ui.settings.CameraYamlEditor
 import com.zektopic.frigate.ui.theme.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1118,10 +1120,15 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                     .clip(RoundedCornerShape(8.dp))
                     .background(Color.Black)
             ) {
+                // setVideoURI, not setVideoPath: clips recorded to a user-chosen folder
+                // are content:// documents, which setVideoPath(String) mangles.
+                val videoUri = remember(videoUrl) {
+                    com.zektopic.frigate.data.RecordingStore.toPlayableUri(videoUrl)
+                }
                 AndroidView(
                     factory = { context ->
                         VideoView(context).apply {
-                            setVideoPath(videoUrl)
+                            setVideoURI(videoUri)
                             tag = videoUrl
                             val mediaController = MediaController(context)
                             mediaController.setAnchorView(this)
@@ -1135,7 +1142,7 @@ fun VideoPlayer(videoUrl: String, onClose: () -> Unit) {
                     update = { view ->
                         // Guard to avoid resetting same path during recomposition
                         if (view.tag != videoUrl) {
-                            view.setVideoPath(videoUrl)
+                            view.setVideoURI(videoUri)
                             view.tag = videoUrl
                         }
                     },
@@ -1169,11 +1176,19 @@ fun RecordingListItem(event: EventEntity, onPlayClick: () -> Unit) {
         val format = java.text.SimpleDateFormat("MMM dd, HH:mm:ss", java.util.Locale.getDefault())
         format.format(date)
     }
-    // Decode the snapshot thumbnail off the main thread
-    val snapshot by remember(event.snapshotPath) {
-        mutableStateOf(event.snapshotPath?.let {
-            try { android.graphics.BitmapFactory.decodeFile(it) } catch (e: Exception) { null }
-        })
+    // Decode the snapshot thumbnail off the composition thread. The stored ref is an
+    // absolute path for the default location and a document URI when recordings go to a
+    // user-chosen folder — the latter is a provider round-trip, far too slow to do inline
+    // while a LazyColumn is scrolling.
+    val snapshotContext = LocalContext.current
+    val snapshot by produceState<android.graphics.Bitmap?>(null, event.snapshotPath) {
+        val ref = event.snapshotPath
+        value = if (ref == null) null else withContext(Dispatchers.IO) {
+            try {
+                com.zektopic.frigate.data.RecordingStore(snapshotContext).openInput(ref)
+                    ?.use { android.graphics.BitmapFactory.decodeStream(it) }
+            } catch (e: Exception) { null }
+        }
     }
     val hasClip = !event.videoPath.isNullOrEmpty()
 
@@ -1271,10 +1286,14 @@ fun SystemScreen(
     val context = LocalContext.current
     var cpuVal by remember { mutableFloatStateOf(0.0f) }
     var ramVal by remember { mutableFloatStateOf(0.0f) }
-    var diskVal by remember { mutableFloatStateOf(0.0f) }
+    // Null when the recording destination is a provider whose free space Android will
+    // not report (cloud/network trees) — the gauge shows nothing rather than quoting
+    // internal storage's numbers while clips go somewhere else entirely.
+    var diskVal by remember { mutableStateOf<Float?>(0.0f) }
     // Real decoder actually initialized per camera, read from StreamDiagnostics.
     // Empty until MediaCodec reports one — never a placeholder or a guess.
     var decoders by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    val recordingStore = remember { com.zektopic.frigate.data.RecordingStore(context) }
 
     // Real device metrics: RAM via ActivityManager, disk via StatFs
     LaunchedEffect(isServiceRunning, cpu) {
@@ -1287,9 +1306,12 @@ fun SystemScreen(
                 ((memInfo.totalMem - memInfo.availMem).toDouble() / memInfo.totalMem).toFloat()
             } else 0.0f
 
-            val stat = android.os.StatFs(context.filesDir.absolutePath)
-            val total = stat.totalBytes
-            diskVal = if (total > 0) ((total - stat.availableBytes).toDouble() / total).toFloat() else 0.0f
+            // Measure the volume recordings actually land on, not always internal storage.
+            // Off the main thread: volumeStats() walks every mounted volume.
+            val volume = withContext(Dispatchers.IO) { recordingStore.volumeStats() }
+            diskVal = volume?.let { (total, available) ->
+                if (total > 0) ((total - available).toDouble() / total).toFloat() else 0.0f
+            }
 
             decoders = if (isServiceRunning) {
                 com.zektopic.frigate.media.StreamDiagnostics.byCamera
@@ -1416,7 +1438,7 @@ fun SystemScreen(
 }
 
 @Composable
-fun GaugeIndicator(label: String, value: Float, color: Color) {
+fun GaugeIndicator(label: String, value: Float?, color: Color) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
@@ -1434,17 +1456,19 @@ fun GaugeIndicator(label: String, value: Float, color: Color) {
                     useCenter = false,
                     style = Stroke(width = 6.dp.toPx(), cap = StrokeCap.Round)
                 )
-                drawArc(
-                    color = color,
-                    startAngle = 135f,
-                    sweepAngle = 270f * value,
-                    useCenter = false,
-                    style = Stroke(width = 6.dp.toPx(), cap = StrokeCap.Round)
-                )
+                if (value != null) {
+                    drawArc(
+                        color = color,
+                        startAngle = 135f,
+                        sweepAngle = 270f * value,
+                        useCenter = false,
+                        style = Stroke(width = 6.dp.toPx(), cap = StrokeCap.Round)
+                    )
+                }
             }
 
             Text(
-                text = "${(value * 100).toInt()}%",
+                text = value?.let { "${(it * 100).toInt()}%" } ?: "—",
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Black,
                 color = TextPrimary

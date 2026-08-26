@@ -5,9 +5,8 @@ import android.graphics.Bitmap
 import android.util.Log
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.NvrDao
+import com.zektopic.frigate.data.RecordingStore
 import java.io.File
-import java.io.FileOutputStream
-import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -16,18 +15,21 @@ import java.util.concurrent.ConcurrentHashMap
  * A recording session is opened per camera on motion ([onMotion]); every frame
  * that arrives while a session is active is encoded ([offerFrame]). The session
  * finalizes after [TAIL_MS] of no motion or once [MAX_CLIP_MS] is reached,
- * producing a playable MP4 in the app's external files dir. The completed clip's
- * path is delivered via [onClipFinished] so the caller can attach it to an event.
+ * producing a playable MP4. The completed clip's ref — an absolute path, or a
+ * document URI when the user has pointed recordings at an SD card or other
+ * folder — is returned from [reapIdleSessions] so the caller can attach it to
+ * an event.
+ *
+ * Encoding always targets a real file in [RecordingStore.stagingDir]; the clip
+ * moves to its final destination in [reapIdleSessions]. See [RecordingStore] for
+ * why the encoder never writes into a SAF tree directly.
  */
 class ClipRecorder(
     private val context: Context,
-    private val nvrDao: NvrDao
+    private val nvrDao: NvrDao,
+    private val store: RecordingStore = RecordingStore(context)
 ) {
     private val tag = "ClipRecorder"
-
-    private val baseRecordingsDir: File by lazy {
-        File(context.getExternalFilesDir(null), "frigate_recordings").apply { if (!exists()) mkdirs() }
-    }
 
     private data class Session(
         val encoder: VideoClipEncoder,
@@ -53,6 +55,14 @@ class ClipRecorder(
 
     /** Live encoder permits, bounding concurrent MediaCodec encoders across all cameras. */
     private val encoderPermits = java.util.concurrent.Semaphore(maxConcurrentEncoders)
+
+    init {
+        // Anything left in staging is from a process that died mid-encode: the muxer never
+        // wrote its moov atom, so the file is unplayable. Publishing it would put junk in
+        // the user's folder; drop it instead of letting it accumulate.
+        val orphans = store.stagingDir.listFiles()?.count { it.isFile && it.delete() } ?: 0
+        if (orphans > 0) Log.w(tag, "Discarded $orphans truncated clip(s) left in staging")
+    }
 
     companion object {
         private const val TAIL_MS = 6_000L       // keep recording this long after motion stops
@@ -94,7 +104,7 @@ class ClipRecorder(
             return
         }
 
-        val file = File(baseRecordingsDir, "${camera.id}_${now}.mp4")
+        val file = File(store.stagingDir, "${camera.id}_${now}.mp4")
         val w = if (firstFrame.width > 0) firstFrame.width else camera.detectWidth
         val h = if (firstFrame.height > 0) firstFrame.height else camera.detectHeight
         val encoder = VideoClipEncoder(w, h, camera.fps.coerceAtLeast(1), file)
@@ -129,15 +139,21 @@ class ClipRecorder(
         session.encoder.encodeFrame(bitmap)
     }
 
-    /** Returns the completed clip path if a session for this camera just finalized, else null. */
+    /**
+     * Close out a session and hand back its staged file, or null if the encoder produced
+     * nothing playable.
+     *
+     * Deliberately does *not* publish: moving the clip to its destination can mean copying
+     * tens of megabytes to an SD card, and this method holds the same monitor as [onMotion],
+     * which runs on the frame path. Callers publish outside the lock.
+     */
     @Synchronized
-    private fun finishSession(cameraId: String, session: Session): String? {
+    private fun detachSession(cameraId: String, session: Session): File? {
         if (sessions.remove(cameraId) == null) return null
         activeSessions.decrementAndGet()
         val ok = try { session.encoder.stop() } finally { encoderPermits.release() }
         return if (ok) {
-            Log.i(tag, "Finished clip ${session.file.name} (${session.file.length()} bytes)")
-            session.file.absolutePath
+            session.file
         } else {
             session.file.delete()
             Log.w(tag, "Clip for $cameraId produced no playable file; discarded")
@@ -145,48 +161,76 @@ class ClipRecorder(
         }
     }
 
-    /** Poll for any sessions that have gone idle and finalize them; returns finished (cameraId, path) pairs. */
+    /** Poll for any sessions that have gone idle and finalize them; returns finished (cameraId, ref) pairs. */
     fun reapIdleSessions(): List<Pair<String, String>> {
         val finished = mutableListOf<Pair<String, String>>()
         val now = System.currentTimeMillis()
         for ((cameraId, session) in sessions) {
             if (now - session.lastMotionAt > TAIL_MS || now - session.startedAt > MAX_CLIP_MS) {
-                finishSession(cameraId, session)?.let { finished.add(cameraId to it) }
+                val staged = detachSession(cameraId, session) ?: continue
+                val bytes = staged.length()
+                val ref = store.publish(staged, RecordingStore.MIME_MP4)
+                if (ref != null) {
+                    Log.i(tag, "Finished clip ${staged.name} ($bytes bytes) -> $ref")
+                    finished.add(cameraId to ref)
+                }
             }
         }
         return finished
     }
 
-    /** Stop and finalize all recordings (service shutdown). */
+    /**
+     * Stop and finalize all recordings (service shutdown, memory pressure).
+     *
+     * Stashes locally instead of publishing: both callers are on the main thread, and
+     * `onTrimMemory` at CRITICAL is the worst possible moment to copy megabytes to an
+     * SD card. The clips are not lost — they land in the default location, which is
+     * listed, played and swept exactly like the custom one.
+     */
     fun stopAll() {
         for ((cameraId, session) in sessions.toMap()) {
-            finishSession(cameraId, session)
+            detachSession(cameraId, session)?.let { store.stashLocally(it) }
         }
     }
 
-    fun saveEventSnapshot(cameraId: String, label: String, bitmap: Bitmap): File? {
-        val destFile = File(baseRecordingsDir, "${cameraId}_${label}_${System.currentTimeMillis()}.jpg")
-        return try {
-            FileOutputStream(destFile).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }
-            destFile
-        } catch (e: IOException) {
-            Log.e(tag, "Failed to save event snapshot", e)
-            null
+    /** Writes a JPEG for an event thumbnail; returns its ref (path or document URI). */
+    fun saveEventSnapshot(cameraId: String, label: String, bitmap: Bitmap): String? {
+        val name = "${cameraId}_${label}_${System.currentTimeMillis()}.jpg"
+        return store.write(name, RecordingStore.MIME_JPEG) {
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it)
         }
     }
 
-    suspend fun enforceRetentionPolicy(camera: CameraConfigEntity) {
+    /**
+     * Delete recordings past their camera's retention window, across every location the
+     * app writes to.
+     *
+     * Age comes from the file's own timestamp rather than the epoch millis in its name:
+     * a SAF provider renames on collision ("cam_1724.mp4" -> "cam_1724 (1).mp4"), which
+     * would make the parsed timestamp null and quietly exempt the file from purging
+     * forever. The camera prefix survives that rename, so scoping still works.
+     *
+     * Takes every camera at once — one directory listing per sweep instead of one
+     * provider round-trip per camera.
+     */
+    suspend fun enforceRetentionPolicy(cameras: List<CameraConfigEntity>) {
+        if (cameras.isEmpty()) return
         try {
-            val expirationLimitMs = System.currentTimeMillis() - (camera.recordingRetentionDays * 24 * 60 * 60 * 1000).toLong()
-            val files = baseRecordingsDir.listFiles { _, name -> name.startsWith("${camera.id}_") } ?: emptyArray()
-            var purged = 0
-            for (file in files) {
-                val parts = file.nameWithoutExtension.split("_")
-                val timestamp = parts.lastOrNull()?.toLongOrNull()
-                if (timestamp != null && timestamp < expirationLimitMs && file.delete()) purged++
+            val now = System.currentTimeMillis()
+            val cutoffByPrefix = cameras.associate { camera ->
+                "${camera.id}_" to now - (camera.recordingRetentionDays * 24 * 60 * 60 * 1000).toLong()
             }
-            nvrDao.deleteEventsOlderThan(expirationLimitMs)
-            if (purged > 0) Log.i(tag, "Purged $purged expired recording(s) for ${camera.name}")
+            var purged = 0
+            for (entry in store.list()) {
+                val cutoff = cutoffByPrefix.entries
+                    .firstOrNull { entry.name.startsWith(it.key) }?.value ?: continue
+                if (entry.lastModified in 1 until cutoff && store.delete(entry.ref)) purged++
+            }
+            // The smallest cutoff belongs to the longest retention window — deleting only
+            // events older than that never drops one a camera still wants to keep.
+            val oldestCutoff = cutoffByPrefix.values.minOrNull() ?: return
+            nvrDao.deleteEventsOlderThan(oldestCutoff)
+            if (purged > 0) Log.i(tag, "Purged $purged expired recording(s)")
         } catch (e: Exception) {
             Log.e(tag, "Retention sweep error", e)
         }

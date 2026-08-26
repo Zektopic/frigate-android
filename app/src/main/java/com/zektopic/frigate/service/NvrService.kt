@@ -374,7 +374,7 @@ class NvrService : Service(), LifecycleOwner {
 
             // Save a snapshot for the event thumbnail — gated by the Snapshots toggle
             val snapshotPath = if (features.snapshots)
-                clipRecorder.saveEventSnapshot(cameraId, "motion", bitmap)?.absolutePath
+                clipRecorder.saveEventSnapshot(cameraId, "motion", bitmap)
             else null
 
             // Insert event; videoPath is attached when the clip finalizes (see reap loop)

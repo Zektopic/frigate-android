@@ -1,6 +1,8 @@
 package com.zektopic.frigate.ui.settings
 
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -23,12 +25,12 @@ import com.zektopic.frigate.data.AppPreferences
 import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.EventEntity
 import com.zektopic.frigate.data.NotificationSettings
+import com.zektopic.frigate.data.RecordingStore
 import com.zektopic.frigate.ui.theme.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 
 // ---------------------------------------------------------------------------
 // Shared section chrome
@@ -247,18 +249,43 @@ private fun SettingsSwitchRow(
 fun StorageSection(onClearAllRecordings: suspend () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val store = remember { RecordingStore(context) }
+
     var totalBytes by remember { mutableStateOf(0L) }
     var clipCount by remember { mutableStateOf(0) }
+    var location by remember { mutableStateOf(store.displayLocation()) }
+    var isCustom by remember { mutableStateOf(store.isCustomDestination) }
+    var available by remember { mutableStateOf(true) }
+    var freeBytes by remember { mutableStateOf<Long?>(null) }
     var refreshKey by remember { mutableStateOf(0) }
     var confirmClear by remember { mutableStateOf(false) }
     var clearing by remember { mutableStateOf(false) }
 
+    // The system folder picker. Any tree it returns is fair game: internal storage,
+    // an SD card, a USB stick, or a cloud provider.
+    val pickFolder = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val tree = result.data?.data
+        if (result.resultCode == android.app.Activity.RESULT_OK && tree != null) {
+            if (store.setDestination(tree)) {
+                Toast.makeText(context, "Recordings will be saved to the selected folder", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(context, "Could not keep access to that folder", Toast.LENGTH_LONG).show()
+            }
+            refreshKey++
+        }
+    }
+
     LaunchedEffect(refreshKey) {
         withContext(Dispatchers.IO) {
-            val dir = File(context.getExternalFilesDir(null), "frigate_recordings")
-            val files = dir.listFiles() ?: emptyArray()
-            totalBytes = files.sumOf { it.length() }
-            clipCount = files.count { it.extension.equals("mp4", ignoreCase = true) }
+            val entries = store.list()
+            totalBytes = entries.sumOf { it.sizeBytes }
+            clipCount = entries.count { it.name.endsWith(".mp4", ignoreCase = true) }
+            location = store.displayLocation()
+            isCustom = store.isCustomDestination
+            available = store.isAvailable()
+            freeBytes = store.volumeStats()?.second
         }
     }
 
@@ -266,7 +293,66 @@ fun StorageSection(onClearAllRecordings: suspend () -> Unit) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             StorageStat("Recordings", "$clipCount")
             StorageStat("On disk", formatBytes(totalBytes))
+            StorageStat("Free", freeBytes?.let { formatBytes(it) } ?: "\u2014")
         }
+
+        Divider(color = SlateBorder)
+
+        Text("Recording location", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
+        Text(location, fontSize = 10.sp, color = TextMuted)
+        Text(
+            if (isCustom) "Custom folder" else "Default app storage",
+            fontSize = 10.sp,
+            color = if (isCustom) FrigateBlue else TextMuted
+        )
+
+        // A persisted folder grant outlives the card. Say so, loudly, rather than letting
+        // the service quietly fall back for a week.
+        if (!available) {
+            Text(
+                "This folder is not reachable right now \u2014 the card may be removed or " +
+                    "reformatted. New recordings are being saved to the default location.",
+                fontSize = 10.sp,
+                color = StatusRed
+            )
+        }
+
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { pickFolder.launch(RecordingStore.pickerIntent()) },
+                shape = RoundedCornerShape(6.dp),
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = FrigateBlue)
+            ) {
+                Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Choose folder", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
+            if (isCustom) {
+                OutlinedButton(
+                    onClick = {
+                        store.clearDestination()
+                        refreshKey++
+                        Toast.makeText(context, "Using default storage", Toast.LENGTH_SHORT).show()
+                    },
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextMuted)
+                ) {
+                    Text("Use default", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+
+        Text(
+            "Changing the location affects new recordings only. Existing clips stay where " +
+                "they are and keep playing.",
+            fontSize = 10.sp,
+            color = TextMuted
+        )
+
+        Divider(color = SlateBorder)
+
         OutlinedButton(
             onClick = { confirmClear = true },
             enabled = !clearing && totalBytes > 0,
@@ -289,7 +375,7 @@ fun StorageSection(onClearAllRecordings: suspend () -> Unit) {
             onDismissRequest = { confirmClear = false },
             containerColor = SlateCard,
             title = { Text("Clear all recordings?", color = TextPrimary) },
-            text = { Text("This permanently deletes every recorded clip, snapshot, and event. This cannot be undone.", color = TextMuted, fontSize = 13.sp) },
+            text = { Text("This permanently deletes every recorded clip, snapshot, and event \u2014 in the current folder and in the default location. This cannot be undone.", color = TextMuted, fontSize = 13.sp) },
             confirmButton = {
                 Button(
                     onClick = {
@@ -297,10 +383,7 @@ fun StorageSection(onClearAllRecordings: suspend () -> Unit) {
                         clearing = true
                         scope.launch {
                             try {
-                                withContext(Dispatchers.IO) {
-                                    val dir = File(context.getExternalFilesDir(null), "frigate_recordings")
-                                    dir.listFiles()?.forEach { it.delete() }
-                                }
+                                withContext(Dispatchers.IO) { store.deleteAll() }
                                 onClearAllRecordings()
                                 Toast.makeText(context, "Recordings cleared", Toast.LENGTH_SHORT).show()
                             } catch (e: Exception) {
@@ -355,9 +438,7 @@ fun AboutSection(
     val configVersion = remember(configYaml) {
         Regex("(?m)^version:\\s*(.+)$").find(configYaml)?.groupValues?.get(1)?.trim() ?: "—"
     }
-    val storagePath = remember {
-        File(context.getExternalFilesDir(null), "frigate_recordings").absolutePath
-    }
+    val storagePath = remember { RecordingStore(context).displayLocation() }
 
     SettingsSectionCard("About", Icons.Default.Info) {
         AboutRow("App version", versionName)
