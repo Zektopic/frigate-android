@@ -351,6 +351,13 @@ fun StorageSection(onClearAllRecordings: suspend () -> Unit) {
             color = TextMuted
         )
 
+        Text(
+            "Recording never stops for lack of space: when free space drops below 1 GB, the " +
+                "oldest recordings are deleted until 2 GB is free.",
+            fontSize = 10.sp,
+            color = TextMuted
+        )
+
         Divider(color = SlateBorder)
 
         OutlinedButton(

@@ -200,39 +200,4 @@ class ClipRecorder(
             bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it)
         }
     }
-
-    /**
-     * Delete recordings past their camera's retention window, across every location the
-     * app writes to.
-     *
-     * Age comes from the file's own timestamp rather than the epoch millis in its name:
-     * a SAF provider renames on collision ("cam_1724.mp4" -> "cam_1724 (1).mp4"), which
-     * would make the parsed timestamp null and quietly exempt the file from purging
-     * forever. The camera prefix survives that rename, so scoping still works.
-     *
-     * Takes every camera at once — one directory listing per sweep instead of one
-     * provider round-trip per camera.
-     */
-    suspend fun enforceRetentionPolicy(cameras: List<CameraConfigEntity>) {
-        if (cameras.isEmpty()) return
-        try {
-            val now = System.currentTimeMillis()
-            val cutoffByPrefix = cameras.associate { camera ->
-                "${camera.id}_" to now - (camera.recordingRetentionDays * 24 * 60 * 60 * 1000).toLong()
-            }
-            var purged = 0
-            for (entry in store.list()) {
-                val cutoff = cutoffByPrefix.entries
-                    .firstOrNull { entry.name.startsWith(it.key) }?.value ?: continue
-                if (entry.lastModified in 1 until cutoff && store.delete(entry.ref)) purged++
-            }
-            // The smallest cutoff belongs to the longest retention window — deleting only
-            // events older than that never drops one a camera still wants to keep.
-            val oldestCutoff = cutoffByPrefix.values.minOrNull() ?: return
-            nvrDao.deleteEventsOlderThan(oldestCutoff)
-            if (purged > 0) Log.i(tag, "Purged $purged expired recording(s)")
-        } catch (e: Exception) {
-            Log.e(tag, "Retention sweep error", e)
-        }
-    }
 }

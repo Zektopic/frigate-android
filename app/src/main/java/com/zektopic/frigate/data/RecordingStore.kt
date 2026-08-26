@@ -182,6 +182,20 @@ class RecordingStore(private val context: Context) {
         File(externalBase, STAGING_DIR_NAME).apply { if (!exists()) mkdirs() }
     }
 
+    /**
+     * Free bytes on the volume [stagingDir] sits on, or null if it cannot be measured.
+     *
+     * Distinct from [volumeStats], which measures the *destination*. Every clip is encoded
+     * into staging first whatever the destination is, so a full app volume stops recording
+     * even when a chosen SD card has tens of gigabytes free.
+     */
+    fun freeBytesOnStagingVolume(): Long? = try {
+        android.os.StatFs(stagingDir.absolutePath).availableBytes
+    } catch (e: Exception) {
+        Log.w(tag, "Could not measure staging volume", e)
+        null
+    }
+
     /** Resolve — creating if needed — the `frigate_recordings` folder inside the picked tree. */
     private fun destinationDirUri(): Uri? {
         val tree = treeUri ?: return null

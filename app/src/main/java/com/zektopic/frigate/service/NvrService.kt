@@ -73,6 +73,7 @@ class NvrService : Service(), LifecycleOwner {
 
     // Motion-triggered clip recording
     private lateinit var clipRecorder: com.zektopic.frigate.media.ClipRecorder
+    private lateinit var recordingJanitor: com.zektopic.frigate.data.RecordingJanitor
     private val cameraById = java.util.concurrent.ConcurrentHashMap<String, CameraConfigEntity>()
     private val activeEventIdByCamera = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
@@ -92,6 +93,9 @@ class NvrService : Service(), LifecycleOwner {
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
 
         clipRecorder = com.zektopic.frigate.media.ClipRecorder(this, nvrDao)
+        recordingJanitor = com.zektopic.frigate.data.RecordingJanitor(
+            com.zektopic.frigate.data.RecordingStore(applicationContext), nvrDao
+        )
 
         // Cache notification preferences so alert gating is enforced at post time
         appPreferences = com.zektopic.frigate.data.AppPreferences(applicationContext)
@@ -120,6 +124,16 @@ class NvrService : Service(), LifecycleOwner {
                         }
                     }
                 }
+            }
+        }
+
+        // Make room for new recordings before a full disk can stop them. Separate from the
+        // 2s reap loop above: a sweep lists every recording in every location, which is far
+        // too expensive to run at that cadence.
+        serviceScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                recordingJanitor.sweep()
+                kotlinx.coroutines.delay(60_000)
             }
         }
 

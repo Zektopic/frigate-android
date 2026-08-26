@@ -57,6 +57,26 @@ interface NvrDao {
     @Query("UPDATE nvr_events SET videoPath = :videoPath WHERE id = :eventId")
     suspend fun updateEventVideoPath(eventId: Long, videoPath: String)
 
+    /**
+     * Detach events from files the janitor has deleted.
+     *
+     * By ref rather than by timestamp: for a clip published into a SAF tree the file's
+     * lastModified is the provider's publish time while [EventEntity.timestamp] is when
+     * motion fired, so the two orderings diverge — a time cutoff would both strand rows
+     * pointing at deleted files and drop rows whose files are still there.
+     *
+     * Chunk the refs: these bind one variable per entry and SQLite caps that.
+     */
+    @Query("UPDATE nvr_events SET videoPath = NULL WHERE videoPath IN (:refs)")
+    suspend fun clearEventVideoPaths(refs: List<String>)
+
+    @Query("UPDATE nvr_events SET snapshotPath = NULL WHERE snapshotPath IN (:refs)")
+    suspend fun clearEventSnapshotPaths(refs: List<String>)
+
+    /** Drop rows left with neither a clip nor a snapshot — nothing to show, nothing to play. */
+    @Query("DELETE FROM nvr_events WHERE videoPath IS NULL AND snapshotPath IS NULL")
+    suspend fun deleteEventsWithoutMedia()
+
     @Query("SELECT COUNT(*) FROM nvr_events")
     fun getEventCountFlow(): Flow<Long>
 
