@@ -75,6 +75,8 @@ class StreamIngester(
     }
 
     private var hasAttemptedFallback = false
+    /** The URL that most recently reached LIVE; reconnects go back to it. */
+    private var lastLiveUrl: String? = null
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var connectionWatchdogRunnable: Runnable? = null
@@ -98,6 +100,7 @@ class StreamIngester(
         val myGeneration = generation.incrementAndGet()
         currentRtspUrl = config.effectiveDetectUrl
         hasAttemptedFallback = false
+        lastLiveUrl = null
         retryAttempt = 0
         Log.i(tag, "Starting stream ingestion for ${config.name} (gen=$myGeneration)...")
         setState(StreamState.CONNECTING)
@@ -176,21 +179,16 @@ class StreamIngester(
      */
     private fun scheduleReconnect(reason: String) {
         if (!isIngesting) return
-        val fallback = getFallbackRtspUrl(currentRtspUrl)
-        if (fallback != null && !hasAttemptedFallback) {
-            Log.i(tag, "Switching to fallback RTSP URL ($reason): $fallback")
-            hasAttemptedFallback = true
-            currentRtspUrl = fallback
-        } else if (hasAttemptedFallback && currentRtspUrl != config.effectiveDetectUrl) {
-            // The fallback failed too, so it was the wrong guess - go back to the URL
-            // the user actually configured and stay there. The guesses are heuristics
-            // (notably appending ?video=h264, which matches almost any URL), and a
-            // wrong one is not merely useless: go2rtc returns 404 for a codec it has
-            // no source for, so a camera that was working would otherwise retry a
-            // 404 forever, with escalating backoff and no way back.
-            Log.i(tag, "Fallback URL also failed ($reason); reverting to ${config.effectiveDetectUrl}")
-            currentRtspUrl = config.effectiveDetectUrl
-        }
+        val next = ReconnectUrlPolicy.next(
+            configured = config.effectiveDetectUrl,
+            current = currentRtspUrl,
+            fallback = getFallbackRtspUrl(config.effectiveDetectUrl),
+            lastLiveUrl = lastLiveUrl,
+            attemptedFallback = hasAttemptedFallback
+        )
+        next.why?.let { Log.i(tag, "$it ($reason): ${next.url}") }
+        currentRtspUrl = next.url
+        hasAttemptedFallback = next.attemptedFallback
         stopProducers()
         retryAttempt++
         val delayMs = (2000L shl (retryAttempt - 1).coerceAtMost(5)).coerceAtMost(60_000L)
@@ -459,19 +457,9 @@ class StreamIngester(
                                 Log.e(tag, "ExoPlayer error: ${error.message} (${error.errorCodeName}).")
                                 StreamDiagnostics.setError(config.id, currentRtspUrl, "${error.errorCodeName}: ${error.message}")
                                 mainHandler.post {
-                                    if (isIngesting) {
-                                        val fallback = getFallbackRtspUrl(currentRtspUrl)
-                                        if (fallback != null && !hasAttemptedFallback) {
-                                            // Switch to the sub-stream URL; the reconnect path
-                                            // rebuilds the player, watchdogs and lastFrameTime.
-                                            Log.i(tag, "Will retry with fallback RTSP URL: $fallback")
-                                            hasAttemptedFallback = true
-                                            currentRtspUrl = fallback
-                                            scheduleReconnect("player error, switching to fallback URL")
-                                        } else {
-                                            scheduleReconnect("player error: ${error.errorCodeName}")
-                                        }
-                                    }
+                                    // scheduleReconnect picks the URL (fallback included); switching
+                                    // here as well made it see a failed fallback and revert at once.
+                                    if (isIngesting) scheduleReconnect("player error: ${error.errorCodeName}")
                                 }
                             }
                         })
@@ -597,6 +585,7 @@ class StreamIngester(
                             mainHandler.post {
                                 if (isIngesting && generation.get() == myGeneration) {
                                     retryAttempt = 0
+                                    lastLiveUrl = currentRtspUrl
                                     setState(StreamState.LIVE)
                                 }
                             }
@@ -983,6 +972,49 @@ class StreamIngester(
             }
             else -> null
         }
+    }
+}
+
+/**
+ * Which URL a failed stream reconnects to.
+ *
+ * The rule is to go back to whatever last went LIVE. The earlier logic reverted to the
+ * configured URL whenever the fallback failed, including a fallback that had been
+ * working for hours: back_garden and kitchen_camera (HEVC with B-frames the tablet's
+ * decoder never outputs) only run on go2rtc's `?video=h264`, so one dropped
+ * connection stranded them on a URL that can never play, OFFLINE until the service
+ * restarted.
+ */
+internal object ReconnectUrlPolicy {
+
+    data class Decision(val url: String, val attemptedFallback: Boolean, val why: String?)
+
+    /**
+     * @param configured the camera's configured detect URL
+     * @param current the URL that just failed
+     * @param fallback the one alternative worth guessing for [configured], or null
+     * @param lastLiveUrl the URL that most recently reached LIVE in this ingester, or null
+     * @param attemptedFallback whether [fallback] has been tried
+     */
+    fun next(
+        configured: String,
+        current: String,
+        fallback: String?,
+        lastLiveUrl: String?,
+        attemptedFallback: Boolean
+    ): Decision = when {
+        lastLiveUrl != null ->
+            Decision(lastLiveUrl, attemptedFallback, if (lastLiveUrl != current) "Returning to the last URL that went live" else null)
+        fallback != null && !attemptedFallback && current == configured ->
+            Decision(fallback, true, "Switching to fallback RTSP URL")
+        current != configured ->
+            // The fallback never went live, so it was the wrong guess - go back to the
+            // configured URL and stay there. The guesses are heuristics (notably
+            // appending ?video=h264, which matches almost any URL), and go2rtc answers a
+            // codec it has no source for with 404, so retrying a wrong guess forever
+            // would lose a camera that works.
+            Decision(configured, attemptedFallback, "Fallback URL never went live; reverting to the configured URL")
+        else -> Decision(current, attemptedFallback, null)
     }
 }
 
