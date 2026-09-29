@@ -92,9 +92,11 @@ lt::settings_pack loopback_settings(TransferOptions const& opt) {
   p.set_bool(lt::settings_pack::enable_natpmp, false);
   p.set_bool(lt::settings_pack::enable_outgoing_utp, false);
   p.set_bool(lt::settings_pack::enable_incoming_utp, false);
-  p.set_int(lt::settings_pack::alert_mask,
-            lt::alert_category::error | lt::alert_category::status |
-                lt::alert_category::storage);
+  auto mask = lt::alert_category::error | lt::alert_category::status | lt::alert_category::storage;
+  if (opt.trace)
+    mask |= lt::alert_category::connect | lt::alert_category::peer |
+            lt::alert_category::performance_warning;
+  p.set_int(lt::settings_pack::alert_mask, mask);
   if (opt.hashing_threads > 0) p.set_int(lt::settings_pack::hashing_threads, opt.hashing_threads);
   if (opt.aio_threads > 0) p.set_int(lt::settings_pack::aio_threads, opt.aio_threads);
   return p;
@@ -129,14 +131,28 @@ std::uint64_t ms_since(clock::time_point t0) {
       std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count());
 }
 
+// Where alerts go once popped: recoverable failures into the report, and
+// everything into stderr when tracing.
+struct AlertSink {
+  rust::Vec<rust::String>& warnings;
+  bool trace;
+  // libtorrent's clock, which alert timestamps use. It is not steady_clock
+  // everywhere (libstdc++ makes high_resolution_clock the system clock).
+  lt::time_point t0 = lt::clock_type::now();
+};
+
 // Throws on the alerts that mean the transfer cannot succeed. Waiting out
 // the timeout instead would hide the one line of evidence the spike exists
 // to collect. Returns the TCP listen port if this batch reported one.
-int check_alerts(lt::session& s, char const* who, rust::Vec<rust::String>& warnings) {
+int check_alerts(lt::session& s, char const* who, AlertSink& sink) {
   std::vector<lt::alert*> alerts;
   s.pop_alerts(&alerts);
   int port = 0;
   for (lt::alert const* a : alerts) {
+    if (sink.trace) {
+      auto const t = std::chrono::duration<double>(a->timestamp() - sink.t0).count();
+      std::fprintf(stderr, "%9.3f %-5s %s: %s\n", t, who, a->what(), a->message().c_str());
+    }
     if (auto const* ok = lt::alert_cast<lt::listen_succeeded_alert>(a)) {
       if (ok->socket_type == lt::socket_type_t::tcp) port = ok->port;
     } else if (auto const* lf = lt::alert_cast<lt::listen_failed_alert>(a)) {
@@ -147,9 +163,9 @@ int check_alerts(lt::session& s, char const* who, rust::Vec<rust::String>& warni
       // needs neither list. Any other listen failure is real.
       std::string const msg = std::string(who) + ": " + a->message();
       if (lf->op != lt::operation_t::enum_route && lf->op != lt::operation_t::enum_if) fail(msg);
-      if (std::none_of(warnings.begin(), warnings.end(),
+      if (std::none_of(sink.warnings.begin(), sink.warnings.end(),
                        [&](rust::String const& w) { return std::string(w) == msg; }))
-        warnings.push_back(msg);
+        sink.warnings.push_back(msg);
     } else if (lt::alert_cast<lt::torrent_error_alert>(a) ||
                lt::alert_cast<lt::file_error_alert>(a)) {
       fail(std::string(who) + ": " + a->message());
@@ -225,6 +241,7 @@ TransferReport loopback_transfer(rust::Str work_dir, std::uint64_t size_bytes,
   auto const start = clock::now();
   auto const deadline = start + std::chrono::milliseconds(timeout_ms);
   clock::time_point teardown_start;
+  AlertSink sink{report.warnings, options.trace};
   {
     lt::session seed(loopback_params(options));
     lt::session leech(loopback_params(options));
@@ -233,33 +250,43 @@ TransferReport loopback_transfer(rust::Str work_dir, std::uint64_t size_bytes,
     while (port == 0) {
       check_deadline(deadline, "the seed to listen");
       seed.wait_for_alert(std::chrono::milliseconds(50));
-      port = check_alerts(seed, "seed", report.warnings);
+      port = check_alerts(seed, "seed", sink);
     }
+
+    // The default flags add a torrent paused and auto-managed, so it only
+    // starts on the session's next tick (every 500 ms), and it already
+    // reports is_seeding while paused. Start both torrents immediately.
+    auto const started_now = lt::torrent_flags::paused | lt::torrent_flags::auto_managed;
 
     lt::add_torrent_params sp;
     sp.ti = ti;
     sp.save_path = seed_dir;
     sp.flags |= lt::torrent_flags::seed_mode;
+    sp.flags &= ~started_now;
     lt::torrent_handle const seeding = seed.add_torrent(std::move(sp));
-    // The leech gets one peer and no trackers; if the seed is not ready when
-    // it connects, the retry backoff would eat most of the timeout.
-    while (!seeding.status().is_seeding) {
+    // The leech gets one peer and no trackers. A paused seed drops its
+    // connection, and the leech then waits min_reconnect_time (60 s) before
+    // retrying, so wait until the seed is running, not just complete.
+    for (;;) {
+      lt::torrent_status const st = seeding.status();
+      if (st.is_seeding && !(st.flags & lt::torrent_flags::paused)) break;
       check_deadline(deadline, "the seed torrent to start");
       seed.wait_for_alert(std::chrono::milliseconds(50));
-      check_alerts(seed, "seed", report.warnings);
+      check_alerts(seed, "seed", sink);
     }
 
     lt::add_torrent_params lp;
     lp.ti = std::make_shared<lt::torrent_info>(*ti);
     lp.save_path = leech_dir;
+    lp.flags &= ~started_now;
     lp.peers.emplace_back(lt::make_address_v4("127.0.0.1"),
                           static_cast<std::uint16_t>(port));
     auto const transfer_start = clock::now();
     lt::torrent_handle const downloading = leech.add_torrent(std::move(lp));
 
     for (;;) {
-      check_alerts(seed, "seed", report.warnings);
-      check_alerts(leech, "leech", report.warnings);
+      check_alerts(seed, "seed", sink);
+      check_alerts(leech, "leech", sink);
       lt::torrent_status const st = downloading.status();
       if (st.is_seeding) {
         report.transfer_ms = ms_since(transfer_start);

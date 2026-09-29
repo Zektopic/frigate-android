@@ -12,6 +12,7 @@
 //!     LT_SPIKE_TORRENT=hybrid|v1|v2
 //!     LT_SPIKE_HASHING_THREADS=N
 //!     LT_SPIKE_AIO_THREADS=N
+//!     LT_SPIKE_TRACE=1        (timestamped peer and connection alerts on stderr)
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -35,6 +36,7 @@ fn options_from_env() -> Result<ffi::TransferOptions, String> {
         torrent: text("LT_SPIKE_TORRENT"),
         hashing_threads: count("LT_SPIKE_HASHING_THREADS")?,
         aio_threads: count("LT_SPIKE_AIO_THREADS")?,
+        trace: std::env::var("LT_SPIKE_TRACE").is_ok_and(|v| v == "1"),
     })
 }
 

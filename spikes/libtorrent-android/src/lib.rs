@@ -42,6 +42,9 @@ pub mod ffi {
         hashing_threads: i32,
         /// `settings_pack::aio_threads` (libtorrent default 10).
         aio_threads: i32,
+        /// Print every connection, peer and performance alert to stderr,
+        /// timestamped, as it is popped.
+        trace: bool,
     }
 
     unsafe extern "C++" {
