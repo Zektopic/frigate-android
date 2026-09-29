@@ -1137,6 +1137,88 @@ object StreamDiagnostics {
     }
 }
 
+/**
+ * Keeps one RTSP connection's interleaved channels where Media3 expects them.
+ *
+ * Media3 (1.3.x) picks each track's TCP channel pair itself (`trackId * 2`, counted
+ * over the tracks it saw in the SDP), asks for it in SETUP, and then only ever listens
+ * on that pair; it never reads the pair in the server's reply. RFC 2326 lets the
+ * server choose, and go2rtc 1.9 does: it numbers channels by the track's position in
+ * *its* SDP. Once [RtspInterceptionInputStream.maybeModifySdp] strips an audio track
+ * listed before the video, the two disagree (asked 0-1, got 2-3), every video packet
+ * lands on a channel nothing reads, and the camera never goes live.
+ *
+ * The request side records each SETUP's `interleaved=` pair by CSeq, the response
+ * side compares it with the server's, and when they differ the input stream rewrites
+ * the channel byte of every interleaved frame back to what Media3 asked for.
+ */
+class InterleavedChannelMap {
+    // First requested channel of each SETUP still waiting for its reply, by CSeq.
+    private val pendingByCseq = HashMap<Int, Int>()
+    // Index is the channel the server sends on; identity until a reply disagrees.
+    private val serverToRequested = IntArray(256) { it }
+
+    /** True once any SETUP reply moved a channel; frames must then be rewritten. */
+    @Volatile var remapping = false
+        private set
+
+    /**
+     * RTP channel Media3 requested in the first SETUP. That is the video: the SDP
+     * rewrite strips every other track, so it is the only one set up.
+     */
+    @Volatile var videoRtpChannel = 0
+        private set
+
+    private var setups = 0
+
+    /** Called with each outgoing RTSP request. */
+    fun onRequest(request: String) {
+        if (!request.startsWith("SETUP ")) return
+        val cseq = header(request, "CSeq")?.toIntOrNull() ?: return
+        val requested = interleavedStart(request) ?: return
+        synchronized(this) {
+            if (setups++ == 0) videoRtpChannel = requested
+            pendingByCseq[cseq] = requested
+        }
+    }
+
+    /**
+     * Called with each incoming RTSP response's header block. Returns it unchanged,
+     * or with the server's `interleaved=` pair replaced by the requested one when the
+     * two differ, so the reply agrees with the frames the client will actually see.
+     */
+    fun onResponse(headers: String): String {
+        val cseq = header(headers, "CSeq")?.toIntOrNull() ?: return headers
+        val requested = synchronized(this) { pendingByCseq.remove(cseq) } ?: return headers
+        val server = interleavedStart(headers) ?: return headers
+        if (server == requested) return headers
+        synchronized(this) {
+            serverToRequested[server] = requested
+            serverToRequested[(server + 1) and 0xFF] = (requested + 1) and 0xFF
+        }
+        remapping = true
+        return headers.replace(INTERLEAVED_PAIR, "interleaved=$requested-${requested + 1}")
+    }
+
+    /** The channel Media3 is listening on for a frame the server sent on [channel]. */
+    fun map(channel: Int): Int = serverToRequested[channel and 0xFF]
+
+    companion object {
+        private val INTERLEAVED_PAIR = Regex("""interleaved=\d+(-\d+)?""", RegexOption.IGNORE_CASE)
+        private val INTERLEAVED_START = Regex("""interleaved=(\d+)""", RegexOption.IGNORE_CASE)
+
+        private fun header(message: String, name: String): String? =
+            message.lineSequence()
+                .firstOrNull { it.startsWith("$name:", ignoreCase = true) }
+                ?.substringAfter(':')?.trim()
+
+        internal fun interleavedStart(message: String): Int? =
+            header(message, "Transport")
+                ?.let { INTERLEAVED_START.find(it)?.groupValues?.get(1)?.toIntOrNull() }
+                ?.takeIf { it in 0..254 }
+    }
+}
+
 class RtspInterceptionSocketFactory(
     private val tag: String,
     private val streamKey: String = ""
@@ -1200,25 +1282,34 @@ class RtspInterceptionSocket(
     override fun getLocalSocketAddress(): java.net.SocketAddress? = delegate.localSocketAddress
     override fun getChannel() = delegate.channel
 
-    override fun getInputStream(): java.io.InputStream {
-        return RtspInterceptionInputStream(delegate.inputStream, tag, streamKey)
+    // Shared by both directions: requests say which channels Media3 wants, responses
+    // say which ones the server will use. Streams are created once so they share it.
+    private val channelMap = InterleavedChannelMap()
+
+    private val interceptedInput by lazy {
+        RtspInterceptionInputStream(delegate.inputStream, tag, streamKey, channelMap)
     }
 
-    override fun getOutputStream(): java.io.OutputStream {
-        return object : java.io.FilterOutputStream(delegate.outputStream) {
+    private val interceptedOutput by lazy {
+        object : java.io.FilterOutputStream(delegate.outputStream) {
             override fun write(b: ByteArray, off: Int, len: Int) {
                 // RTSP requests are written as one buffer each; interleaved
-                // binary frames start with '$' (0x24) — only log the text ones
+                // binary frames start with '$' (0x24) — only inspect the text ones
                 if (len in 1..4096 && b[off] != 0x24.toByte()) {
                     val text = String(b, off, len, java.nio.charset.StandardCharsets.US_ASCII)
                     if (text.firstOrNull()?.isLetter() == true) {
                         Log.d(tag, "RTSP >>> ${text.trimEnd()}")
+                        channelMap.onRequest(text)
                     }
                 }
                 out.write(b, off, len)
             }
         }
     }
+
+    override fun getInputStream(): java.io.InputStream = interceptedInput
+
+    override fun getOutputStream(): java.io.OutputStream = interceptedOutput
 
     override fun setTcpNoDelay(on: Boolean) { delegate.tcpNoDelay = on }
     override fun getTcpNoDelay(): Boolean = delegate.tcpNoDelay
@@ -1247,11 +1338,19 @@ class RtspInterceptionSocket(
 class RtspInterceptionInputStream(
     private val upstream: java.io.InputStream,
     private val tag: String,
-    private val streamKey: String = ""
+    private val streamKey: String = "",
+    private val channelMap: InterleavedChannelMap = InterleavedChannelMap()
 ) : java.io.InputStream() {
-    private var buffer = ByteArray(0)
+    private val noBytes = ByteArray(0)
+    private var buffer = noBytes
     private var bufferPos = 0
     private var bufferLimit = 0
+
+    // While remapping channels in passthrough, only each frame's 4-byte header is
+    // rewritten; this many bytes of the current frame's payload still pass through
+    // untouched, straight into the caller's array.
+    private var frameRemaining = 0
+    private val frameHeader = ByteArray(4)
     @Volatile private var isInterceptionDone = false
     // While true, keep parsing interleaved frames after the SDP so in-band
     // VPS/SPS/PPS NALs can be captured into SpropCache (frames pass through
@@ -1278,7 +1377,12 @@ class RtspInterceptionInputStream(
             return buffer[bufferPos++].toInt() and 0xFF
         }
         if (passthrough) {
-            return upstream.read()
+            if (!channelMap.remapping) return upstream.read()
+            if (frameRemaining > 0) {
+                val b = upstream.read()
+                if (b != -1) frameRemaining--
+                return b
+            }
         }
         fillBuffer()
         if (bufferPos < bufferLimit) {
@@ -1297,7 +1401,12 @@ class RtspInterceptionInputStream(
             return toCopy
         }
         if (passthrough) {
-            return upstream.read(b, off, len)
+            if (!channelMap.remapping) return upstream.read(b, off, len)
+            if (frameRemaining > 0) {
+                val n = upstream.read(b, off, minOf(len, frameRemaining))
+                if (n > 0) frameRemaining -= n
+                return n
+            }
         }
         fillBuffer()
         if (bufferPos < bufferLimit) {
@@ -1321,7 +1430,7 @@ class RtspInterceptionInputStream(
     private fun fillBuffer() {
         bufferPos = 0
         bufferLimit = 0
-        buffer = ByteArray(0)
+        buffer = noBytes
 
         // Read one byte to inspect if it's interleaved data
         val firstByte = upstream.read()
@@ -1329,12 +1438,13 @@ class RtspInterceptionInputStream(
 
         if (firstByte == 0x24) { // '$'
             seenInterleaved = true
-            val channel = upstream.read()
-            if (channel == -1) {
+            val serverChannel = upstream.read()
+            if (serverChannel == -1) {
                 buffer = byteArrayOf(0x24)
                 bufferLimit = 1
                 return
             }
+            val channel = channelMap.map(serverChannel)
             val len1 = upstream.read()
             if (len1 == -1) {
                 buffer = byteArrayOf(0x24, channel.toByte())
@@ -1348,6 +1458,19 @@ class RtspInterceptionInputStream(
                 return
             }
             val packetLen = ((len1 and 0xFF) shl 8) or (len2 and 0xFF)
+            if (passthrough) {
+                // Remapping only (read() takes the plain path otherwise): hand back
+                // the rewritten header and let the payload stream through, rather
+                // than copying every packet for the life of the connection.
+                frameHeader[0] = 0x24
+                frameHeader[1] = channel.toByte()
+                frameHeader[2] = len1.toByte()
+                frameHeader[3] = len2.toByte()
+                buffer = frameHeader
+                bufferLimit = 4
+                frameRemaining = packetLen
+                return
+            }
             val packetBytes = ByteArray(4 + packetLen)
             packetBytes[0] = 0x24
             packetBytes[1] = channel.toByte()
@@ -1392,9 +1515,16 @@ class RtspInterceptionInputStream(
             }
         }
 
-        val headerBytes = headerStream.toByteArray()
-        val headerStr = String(headerBytes, java.nio.charset.StandardCharsets.UTF_8)
+        var headerBytes = headerStream.toByteArray()
+        var headerStr = String(headerBytes, java.nio.charset.StandardCharsets.UTF_8)
         Log.d(tag, "RTSP <<< ${headerStr.trimEnd()}")
+
+        val agreed = channelMap.onResponse(headerStr)
+        if (agreed != headerStr) {
+            Log.i(tag, "Server moved this track's interleaved channels; remapping them to the ones requested")
+            headerStr = agreed
+            headerBytes = agreed.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+        }
 
         var contentType: String? = null
         var contentLength = 0
@@ -1482,12 +1612,13 @@ class RtspInterceptionInputStream(
 
     /**
      * Inspect an interleaved RTSP frame ('$' | channel | 16-bit len | payload)
-     * and capture H.265 VPS/SPS/PPS NAL units from channel-0 RTP packets.
+     * and capture H.265 VPS/SPS/PPS NAL units from the video's RTP packets.
+     * The channel byte has already been mapped to the one Media3 requested.
      */
     private fun sniffRtpPacket(packet: ByteArray, length: Int) {
         if (length < 18) return
         val channel = packet[1].toInt() and 0xFF
-        if (channel != 0) return // video RTP is on the first interleaved channel
+        if (channel != channelMap.videoRtpChannel) return
 
         val rtpStart = 4
         val b0 = packet[rtpStart].toInt() and 0xFF
