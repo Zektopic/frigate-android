@@ -17,9 +17,14 @@ CI workflow. Delete this directory once the decision is made.
   header-only since 1.69, and libtorrent's CMake links `Boost::headers` and nothing else. So the
   Boost risk is only whether the Asio headers compile under NDK clang. Nobody has to get `b2`
   cross-compiling. `build.sh` unpacks the Boost release and points CMake at it.
-- **libtorrent already supports Android.** 2.0 has `TORRENT_ANDROID` code paths. On API 24+ it
-  enumerates interfaces with `getifaddrs` instead of netlink route dumps, which Android 11 blocks
-  for apps.
+- **libtorrent already supports Android, except for route enumeration.** 2.0 has
+  `TORRENT_ANDROID` code paths. On API 24+ it enumerates interfaces with `getifaddrs` instead of
+  netlink, which Android 11 blocks for apps. Nothing replaces the netlink *route* dump, though:
+  `enum_routes` returns "operation not supported", so every session start posts a
+  `listen_failed_alert` with op `enum_route`. libtorrent treats that as informational and listens
+  on the unspecified address instead of expanding it per interface (`session_impl.cpp`, "For
+  Android API >= 24"). Its own comment notes the cost: the IPv6 DHT then does not follow BEP 32
+  and BEP 45. `lt-smoke` prints the alert as a warning rather than failing on it.
 - **The host build passes.** With these same pins on x86_64 Linux, the loopback transfer passes
   with and without OpenSSL. CI runs that check on every change.
 
@@ -44,6 +49,28 @@ To run the smoke test on a device (the build does not do this for you):
 ```bash
 adb push out/android-arm64-v8a-api26-openssl-on/lt-smoke /data/local/tmp/
 adb shell /data/local/tmp/lt-smoke /data/local/tmp/lt-spike 67108864
+```
+
+`lt-smoke` times each phase separately:
+
+- `hash`: building the torrent, before any session starts.
+- `transfer`: from adding the leech until it holds every piece, hash-checked.
+- `teardown`: destroying both sessions, which flushes their disk threads.
+
+The total on the `PASS` line covers the sessions only, not hashing.
+
+To compare configurations on a device without rebuilding, set any of these (unset keeps
+libtorrent's default):
+
+| Variable | Values | libtorrent default |
+|---|---|---|
+| `LT_SPIKE_DISK_IO` | `mmap`, `posix` | `mmap` on 64-bit |
+| `LT_SPIKE_TORRENT` | `hybrid`, `v1`, `v2` | `hybrid` (SHA-1 and SHA-256 on every piece) |
+| `LT_SPIKE_HASHING_THREADS` | positive integer | 1 |
+| `LT_SPIKE_AIO_THREADS` | positive integer | 10 |
+
+```bash
+adb shell LT_SPIKE_DISK_IO=posix /data/local/tmp/lt-smoke /data/local/tmp/lt-spike 268435456
 ```
 
 ## What counts as a pass
