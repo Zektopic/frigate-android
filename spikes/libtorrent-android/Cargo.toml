@@ -1,0 +1,25 @@
+[package]
+name = "lt-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Throwaway spike: libtorrent + Boost behind a cxx bridge, cross-compiled for Android"
+license = "MIT OR Apache-2.0"
+
+# Standalone: this crate is not part of any workspace, and nothing in the
+# Android app depends on it.
+[workspace]
+
+[lib]
+# cdylib is the shape the Android app would load; rlib lets lt-smoke reuse it.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "lt-smoke"
+path = "src/bin/lt-smoke.rs"
+
+[dependencies]
+cxx = "1"
+
+[build-dependencies]
+cxx-build = "1"
