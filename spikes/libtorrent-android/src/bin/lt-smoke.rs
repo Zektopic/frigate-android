@@ -95,6 +95,10 @@ fn main() -> ExitCode {
                 mib_s(r.transfer_ms),
                 r.teardown_ms,
             );
+            println!(
+                "cpu        hash {} ms, sessions {} ms (seed and leech together)",
+                r.hash_cpu_ms, r.session_cpu_ms,
+            );
             // Last line, so build.sh's report can quote it on its own.
             println!(
                 "PASS       {} bytes in {} ms ({:.1} MiB/s), {} pieces x {} KiB, info-hash {}",

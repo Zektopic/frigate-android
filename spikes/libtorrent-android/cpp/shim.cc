@@ -28,6 +28,7 @@
 #include <openssl/opensslv.h>
 #endif
 
+#include <sys/resource.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -131,6 +132,16 @@ std::uint64_t ms_since(clock::time_point t0) {
       std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count());
 }
 
+// User plus system CPU time of the whole process, every thread included.
+std::uint64_t process_cpu_ms() {
+  rusage ru{};
+  ::getrusage(RUSAGE_SELF, &ru);
+  auto const ms = [](timeval const& tv) {
+    return static_cast<std::uint64_t>(tv.tv_sec) * 1000 + static_cast<std::uint64_t>(tv.tv_usec) / 1000;
+  };
+  return ms(ru.ru_utime) + ms(ru.ru_stime);
+}
+
 // Where alerts go once popped: recoverable failures into the report, and
 // everything into stderr when tracing.
 struct AlertSink {
@@ -217,6 +228,7 @@ TransferReport loopback_transfer(rust::Str work_dir, std::uint64_t size_bytes,
   lt::add_files(fs, seed_dir + "/" + name);
   lt::create_torrent ct(fs, 0, torrent_format(options));
   auto const hash_start = clock::now();
+  auto const hash_cpu_start = process_cpu_ms();
   {
     // Same disk backend and thread counts as the sessions below.
     lt::error_code ec;
@@ -225,6 +237,7 @@ TransferReport loopback_transfer(rust::Str work_dir, std::uint64_t size_bytes,
     if (ec) fail("hashing " + seed_dir + ": " + ec.message());
   }
   report.hash_ms = ms_since(hash_start);
+  report.hash_cpu_ms = process_cpu_ms() - hash_cpu_start;
   std::vector<char> torrent;
   lt::bencode(std::back_inserter(torrent), ct.generate());
   auto const ti = std::make_shared<lt::torrent_info>(torrent, lt::from_span);
@@ -239,6 +252,7 @@ TransferReport loopback_transfer(rust::Str work_dir, std::uint64_t size_bytes,
   }
 
   auto const start = clock::now();
+  auto const session_cpu_start = process_cpu_ms();
   auto const deadline = start + std::chrono::milliseconds(timeout_ms);
   clock::time_point teardown_start;
   AlertSink sink{report.warnings, options.trace};
@@ -306,6 +320,7 @@ TransferReport loopback_transfer(rust::Str work_dir, std::uint64_t size_bytes,
   }
   report.teardown_ms = ms_since(teardown_start);
   report.elapsed_ms = ms_since(start);
+  report.session_cpu_ms = process_cpu_ms() - session_cpu_start;
 
   if (read_file(seed_dir + "/" + name) != read_file(leech_dir + "/" + name))
     fail("downloaded file differs from the seeded one");

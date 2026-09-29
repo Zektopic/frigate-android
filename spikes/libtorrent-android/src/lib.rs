@@ -21,6 +21,11 @@ pub mod ffi {
         transfer_ms: u64,
         /// Destroying both sessions, which flushes their disk threads.
         teardown_ms: u64,
+        /// CPU time (user + system, all threads) spent in `hash_ms`.
+        hash_cpu_ms: u64,
+        /// CPU time spent in `elapsed_ms`, seed and leech together: on a
+        /// phone, CPU per byte matters more than loopback throughput.
+        session_cpu_ms: u64,
         piece_length: u32,
         num_pieces: u32,
         info_hash: String,
