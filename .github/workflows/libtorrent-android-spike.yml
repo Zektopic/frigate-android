@@ -1,0 +1,102 @@
+name: libtorrent Android spike
+
+# Builds spikes/libtorrent-android. Independent of the app build: nothing in
+# the Gradle project depends on the spike, and this only runs when it changes.
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+    paths:
+      - 'spikes/libtorrent-android/**'
+      - '.github/workflows/libtorrent-android-spike.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'spikes/libtorrent-android/**'
+      - '.github/workflows/libtorrent-android-spike.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+    working-directory: spikes/libtorrent-android
+
+jobs:
+  android:
+    name: Android ${{ matrix.abi }}, OpenSSL ${{ matrix.openssl }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a]
+        openssl: ['on', 'off']
+    env:
+      NDK_VERSION: 27.2.12479018  # r27c
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than whatever the runner image ships, so a CMake major
+      # upgrade can't turn a spike result into a toolchain question.
+      - name: Install CMake 3.31
+        run: |
+          pipx install cmake==3.31.6
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null || true
+          test -f "$ANDROID_HOME/ndk/$NDK_VERSION/source.properties"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: spikes/libtorrent-android/.cache/downloads
+          key: lt-spike-sources-${{ hashFiles('spikes/libtorrent-android/build.sh') }}
+
+      - name: Build and check
+        run: |
+          cmake --version
+          ./build.sh --abi "${{ matrix.abi }}" --openssl "${{ matrix.openssl }}"
+
+      - name: Report
+        if: always()
+        run: cat out/*/report.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report written" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lt-spike-android-${{ matrix.abi }}-openssl-${{ matrix.openssl }}
+          path: spikes/libtorrent-android/out/
+          if-no-files-found: warn
+
+  host:
+    name: Host smoke test, OpenSSL ${{ matrix.openssl }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        openssl: ['on', 'off']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake 3.31
+        run: |
+          pipx install cmake==3.31.6
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: spikes/libtorrent-android/.cache/downloads
+          key: lt-spike-sources-${{ hashFiles('spikes/libtorrent-android/build.sh') }}
+
+      - name: Build and run the loopback transfer
+        run: ./build.sh --host --openssl "${{ matrix.openssl }}"
+
+      - name: Report
+        if: always()
+        run: cat out/*/report.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report written" >> "$GITHUB_STEP_SUMMARY"
