@@ -114,12 +114,15 @@ and `aio_threads=2` takes:
 
 **What the numbers say for the gateway:**
 
-- **Build with OpenSSL.** Without it, libtorrent hashes in portable C. OpenSSL is the path to the
-  CPU's SHA instructions: hashing is about 7× faster at a sixth of the CPU. The cost is 6.4 MiB on
+- **Build with OpenSSL.** Without it, libtorrent hashes in portable C. OpenSSL gives it the CPU's
+  SHA instructions: hashing is about 7× faster at a sixth of the CPU. The only other hash backend
+  libtorrent supports on Android, libgcrypt, is disabled in `build.sh`. The cost is 6.4 MiB on
   the stripped library (10.5 MiB against 4.1 MiB).
 - **Set `aio_threads` to 2 on phones.** Compared with libtorrent's default of 10, it cut session
   CPU by 36% (40.6 to 25.8 s per GiB) and the transfer was slightly faster. 4 threads sits in
-  between, and 1 is too few: the transfer takes 57% longer.
+  between, and 1 is too few: the transfer takes 57% longer. Here both sessions share one process
+  (20 aio threads on 8 cores), so part of the saving may be contention that a single-session
+  gateway won't have. Re-check with one session.
 - **`hashing_threads` only shortens wall time.** Four threads make torrent creation 3.2× faster
   for the same CPU, so raise it only where creation latency matters.
 - **Single-format torrents hash once instead of twice.** Hybrid runs SHA-1 and SHA-256 over every
@@ -149,7 +152,7 @@ and `aio_threads=2` takes:
 |---|---|
 | libtorrent 2.0.15 | Latest release of the stable 2.0 series. To try 2.1.x, change `LT_VERSION` and its hash |
 | Boost 1.92.0 | Headers only (see above) |
-| OpenSSL 3.5.8 | LTS release. It is needed for TLS: HTTPS trackers, HTTPS web seeds (which Archive.org torrents rely on), and SSL torrents. Protocol encryption (PE) works without it. On ARM it is also the only way libtorrent reaches the CPU's SHA instructions (see [Results on a device](#results-on-a-device)) |
+| OpenSSL 3.5.8 | LTS release. It is needed for TLS: HTTPS trackers, HTTPS web seeds (which Archive.org torrents rely on), and SSL torrents. Protocol encryption (PE) works without it. In this build it is also what gives libtorrent the CPU's SHA instructions; without it libtorrent hashes in portable C (see [Results on a device](#results-on-a-device)) |
 | NDK r27c, API 26 | LTS NDK. API 26 is this repo's `minSdk`, and libtorrent's Android code paths want at least 24 |
 | `c++_static` | The NDK's recommendation when an app ships a single native library. That library is the Rust cdylib, and FFmpeg and whisper.cpp would link into it later |
 | `deprecated-functions=OFF` | Smaller binary, and only the 2.x API is available |
