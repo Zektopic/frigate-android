@@ -3,7 +3,22 @@ package com.zektopic.frigate.data
 import org.yaml.snakeyaml.Yaml
 
 object YamlConfigParser {
-    
+
+    /**
+     * `android.max_concurrent_streams`: how many cameras this device ingests at once,
+     * overriding the automatic [com.zektopic.frigate.media.DevicePerformance] budget.
+     * App-specific (Frigate has no such key). Null when absent or not a positive number.
+     */
+    fun parseMaxConcurrentStreams(yamlString: String): Int? {
+        val parsed = try {
+            Yaml().load<Any>(yamlString)
+        } catch (e: Exception) {
+            return null
+        }
+        val android = (parsed as? Map<*, *>)?.get("android") as? Map<*, *> ?: return null
+        return (android["max_concurrent_streams"] as? Number)?.toInt()?.takeIf { it > 0 }
+    }
+
     /**
      * Parses Frigate YAML configuration into a list of CameraConfigEntity
      */

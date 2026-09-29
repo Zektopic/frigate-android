@@ -152,8 +152,13 @@ class EmbeddedWebServer(
                             val rawProfiles = com.zektopic.frigate.media.StreamProfileCache.map.entries
                                 .joinToString(",") { (url, p) -> "\"${esc(url)}\":\"${p.width}x${p.height}\"" }
                             val budget = com.zektopic.frigate.media.DevicePerformance.cachedBudget()
+                            // maxStreams is the device's own cap; effectiveMaxStreams is what
+                            // runs after the config's android.max_concurrent_streams, if any.
+                            val streamCap = com.zektopic.frigate.media.DevicePerformance.streamCapOverride
                             val budgetJson = if (budget == null) "null" else
                                 "{\"tier\":\"${budget.tier}\",\"maxStreams\":${budget.maxConcurrentStreams}," +
+                                    "\"maxStreamsOverride\":${streamCap ?: "null"}," +
+                                    "\"effectiveMaxStreams\":${com.zektopic.frigate.media.DevicePerformance.effectiveMaxStreams(budget, streamCap)}," +
                                     "\"maxEncoders\":${budget.maxConcurrentEncoders}," +
                                     "\"detectFpsCap\":${budget.detectFpsCap}," +
                                     "\"decoderInstances\":${budget.reportedDecoderInstances}," +

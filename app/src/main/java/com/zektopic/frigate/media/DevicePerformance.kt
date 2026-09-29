@@ -62,6 +62,24 @@ object DevicePerformance {
      */
     fun cachedBudget(): PerformanceBudget? = cached
 
+    /**
+     * The config's `android.max_concurrent_streams`, as last applied by NvrService,
+     * or null when the budget decides. Kept here so /api/diag can report it.
+     */
+    @Volatile
+    var streamCapOverride: Int? = null
+
+    /**
+     * How many cameras to ingest at once: the operator's override when set, clamped to
+     * the codec pool (one decoder slot stays free for a clip encoder, as in [compute]),
+     * otherwise the budget's own cap. The tier caps are deliberately cautious; the
+     * override is how an operator who has measured their device raises one.
+     */
+    fun effectiveMaxStreams(budget: PerformanceBudget, override: Int?): Int {
+        val codecCeiling = (budget.reportedDecoderInstances - 1).coerceAtLeast(1)
+        return override?.coerceIn(1, codecCeiling) ?: budget.maxConcurrentStreams
+    }
+
     /** Cached because probing MediaCodecList is not cheap and the answer cannot change. */
     fun budget(context: Context): PerformanceBudget =
         cached ?: synchronized(this) {

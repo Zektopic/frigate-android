@@ -142,4 +142,18 @@ class CameraYamlEditorTest {
         val withoutMqtt = CameraYamlEditor.upsertGlobals(withMqtt, GlobalConfigDraft(mqttHost = ""))
         assertEquals("", CameraYamlEditor.readGlobals(withoutMqtt).mqttHost)
     }
+
+    @Test
+    fun appSpecificStreamCapSurvivesEveryEditor() {
+        val withCap = "android:\n  max_concurrent_streams: 5\n$baseYaml"
+        val edits = listOf(
+            CameraYamlEditor.upsertCamera(withCap, CameraDraft(name = "Porch", rtspUrl = "rtsp://h:8554/porch")),
+            CameraYamlEditor.removeCamera(withCap, "existing_cam"),
+            CameraYamlEditor.setCameraFeature(withCap, "existing_cam", CameraYamlEditor.Feature.RECORD, false),
+            CameraYamlEditor.upsertGlobals(withCap, GlobalConfigDraft(mqttHost = "192.168.1.10"))
+        )
+        for (edited in edits) {
+            assertEquals(edited, 5, YamlConfigParser.parseMaxConcurrentStreams(edited))
+        }
+    }
 }

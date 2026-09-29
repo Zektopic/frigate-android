@@ -156,6 +156,10 @@ class NvrService : Service(), LifecycleOwner {
                 @OptIn(kotlinx.coroutines.FlowPreview::class)
                 nvrDao.getAllCameraConfigsFlow().debounce(500L).collect { cameras ->
                     val activeCameras = cameras.filter { it.isEnabled }
+                    // Read with the cameras rather than from its own flow, so a config
+                    // change that touches both is admitted in one pass.
+                    val streamCap = nvrDao.getSystemConfig()?.configYaml
+                        ?.let { com.zektopic.frigate.data.YamlConfigParser.parseMaxConcurrentStreams(it) }
                     withContext(Dispatchers.Main) {
                         if (activeCameras.isEmpty()) {
                             updateNotification("No active cameras configured. Configure in App UI.")
@@ -169,7 +173,7 @@ class NvrService : Service(), LifecycleOwner {
                             }
                         } else {
                             updateNotification("Monitoring ${activeCameras.size} active camera stream(s)")
-                            startActiveStreams(activeCameras)
+                            startActiveStreams(activeCameras, streamCap)
                         }
                     }
                 }
@@ -246,32 +250,40 @@ class NvrService : Service(), LifecycleOwner {
         super.onDestroy()
     }
 
-    // Track the last camera config set to avoid unnecessary restarts
-    private var lastCameraConfigSnapshot: List<CameraConfigEntity> = emptyList()
+    // Signatures of the cameras last admitted, to avoid unnecessary restarts
+    private var lastAdmittedSignatures: Set<String> = emptySet()
 
-    private fun startActiveStreams(cameras: List<CameraConfigEntity>) {
-        // Compare new config with existing - only restart if something actually changed
-        val newConfigSignatures = cameras.map { configSignature(it) }.toSet()
-        val oldConfigSignatures = lastCameraConfigSnapshot.map { configSignature(it) }.toSet()
+    /**
+     * @param streamCap the config's `android.max_concurrent_streams`, or null to let
+     *   the device budget decide how many of [cameras] to run.
+     */
+    private fun startActiveStreams(cameras: List<CameraConfigEntity>, streamCap: Int?) {
+        val budget = DevicePerformance.budget(this)
+        val cap = DevicePerformance.effectiveMaxStreams(budget, streamCap)
+        DevicePerformance.streamCapOverride = streamCap
+        val admitted = cameras.take(cap)
 
-        if (newConfigSignatures == oldConfigSignatures && activeIngesters.size == cameras.size) {
+        // Compare what would actually run. Comparing every configured camera against
+        // the running ingesters never matched while the cap left some out, so every
+        // emission restarted every stream; comparing the admitted set also restarts
+        // when only the cap changes.
+        val admittedSignatures = admitted.map { configSignature(it) }.toSet()
+        if (admittedSignatures == lastAdmittedSignatures && activeIngesters.size == admitted.size) {
             Log.d(tag, "Camera configs unchanged, skipping stream restart.")
             return
         }
 
-        val budget = DevicePerformance.budget(this)
-        val admitted = cameras.take(budget.maxConcurrentStreams)
+        if (streamCap != null && cap != streamCap) {
+            Log.w(tag, "android.max_concurrent_streams=$streamCap exceeds the codec pool; using $cap")
+        }
         if (admitted.size < cameras.size) {
-            val dropped = cameras.drop(budget.maxConcurrentStreams).joinToString { it.name }
-            Log.w(
-                tag,
-                "Device budget allows ${budget.maxConcurrentStreams} concurrent streams " +
-                    "(${budget.describe()}); not starting: $dropped"
-            )
+            val dropped = cameras.drop(cap).joinToString { it.name }
+            val source = if (streamCap != null) "android.max_concurrent_streams" else "device budget, ${budget.describe()}"
+            Log.w(tag, "Running at most $cap concurrent streams ($source); not starting: $dropped")
         }
 
         Log.i(tag, "Camera configs changed. Restarting ${admitted.size} stream(s)...")
-        lastCameraConfigSnapshot = cameras.toList()
+        lastAdmittedSignatures = admittedSignatures
 
         val pending = mutableListOf<StreamIngester>()
         synchronized(activeIngesters) {

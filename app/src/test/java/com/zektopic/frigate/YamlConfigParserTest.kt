@@ -3,6 +3,7 @@ package com.zektopic.frigate
 import com.zektopic.frigate.data.YamlConfigParser
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class YamlConfigParserTest {
@@ -136,5 +137,29 @@ class YamlConfigParserTest {
         assertEquals("rtsp://host:8554/plain", cam.rtspUrl)
         assertEquals("", cam.detectRtspUrl)
         assertEquals("rtsp://host:8554/plain", cam.effectiveDetectUrl)
+    }
+
+    @Test
+    fun maxConcurrentStreamsIsReadFromTheAndroidSection() {
+        val yaml = """
+            android:
+              max_concurrent_streams: 5
+            cameras:
+              cam:
+                ffmpeg:
+                  inputs:
+                    - path: rtsp://host:8554/cam
+        """.trimIndent()
+        assertEquals(5, YamlConfigParser.parseMaxConcurrentStreams(yaml))
+    }
+
+    @Test
+    fun maxConcurrentStreamsIsNullWhenAbsentOrUnusable() {
+        assertNull(YamlConfigParser.parseMaxConcurrentStreams("cameras: {}"))
+        assertNull(YamlConfigParser.parseMaxConcurrentStreams("android:\n  max_concurrent_streams: 0"))
+        assertNull(YamlConfigParser.parseMaxConcurrentStreams("android:\n  max_concurrent_streams: -2"))
+        assertNull(YamlConfigParser.parseMaxConcurrentStreams("android:\n  max_concurrent_streams: lots"))
+        assertNull(YamlConfigParser.parseMaxConcurrentStreams("android: 5"))
+        assertNull(YamlConfigParser.parseMaxConcurrentStreams("cameras: [unclosed"))
     }
 }
