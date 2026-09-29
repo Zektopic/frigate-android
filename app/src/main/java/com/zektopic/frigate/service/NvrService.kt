@@ -148,16 +148,7 @@ class NvrService : Service(), LifecycleOwner {
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
         
         // Show persistent status notification to run in background
-        val hasCameraPermission = checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        if (android.os.Build.VERSION.SDK_INT >= 29) {
-            var type = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            if (hasCameraPermission) {
-                type = type or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-            }
-            startForeground(1, createStatusNotification("Initializing NVR streams..."), type)
-        } else {
-            startForeground(1, createStatusNotification("Initializing NVR streams..."))
-        }
+        enterForeground(createStatusNotification("Initializing NVR streams..."))
 
         // Observe database configurations flow and launch/reload streams dynamically
         serviceScope.launch {
@@ -191,6 +182,33 @@ class NvrService : Service(), LifecycleOwner {
         }
 
         return START_STICKY
+    }
+
+    /**
+     * Only the device-camera source needs the camera type, and Android 14+ refuses it
+     * unless the app could use the camera right now, which a start from
+     * [BootReceiver] (boot, app update) cannot. RTSP cameras need only dataSync, so
+     * fall back to that rather than fail the whole service.
+     */
+    private fun enterForeground(notification: Notification) {
+        if (android.os.Build.VERSION.SDK_INT < 29) {
+            startForeground(1, notification)
+            return
+        }
+        val dataSync = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        val hasCameraPermission = checkSelfPermission(android.Manifest.permission.CAMERA) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (hasCameraPermission) {
+            try {
+                startForeground(1, notification, dataSync or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+                return
+            } catch (e: SecurityException) {
+                Log.w(tag, "Camera foreground type not allowed from here (${e.message}); running as dataSync")
+            } catch (e: IllegalStateException) {
+                Log.w(tag, "Camera foreground type not allowed from here (${e.message}); running as dataSync")
+            }
+        }
+        startForeground(1, notification, dataSync)
     }
 
     override fun onBind(intent: Intent?): IBinder {

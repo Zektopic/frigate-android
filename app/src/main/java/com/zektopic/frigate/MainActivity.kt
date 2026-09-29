@@ -77,6 +77,8 @@ class MainActivity : ComponentActivity() {
         }
         if (requiredPermissions.isNotEmpty()) {
             requestPermissions(requiredPermissions.toTypedArray(), 101)
+        } else {
+            maybeAskToIgnoreBatteryOptimizations()
         }
 
         setContent {
@@ -167,6 +169,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startNvrService() {
+        com.zektopic.frigate.service.NvrRunState.setShouldRun(this, true)
         val intent = Intent(this, NvrService::class.java)
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -176,8 +179,34 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopNvrService() {
+        // An explicit Stop also keeps BootReceiver from restarting it after a reboot
+        com.zektopic.frigate.service.NvrRunState.setShouldRun(this, false)
         val intent = Intent(this, NvrService::class.java)
         stopService(intent)
+    }
+
+    /**
+     * Asks once to exempt the app from battery optimization: Doze and app standby
+     * otherwise defer the network access and wakeups an always-on NVR depends on.
+     * Asked after the runtime permissions so the two system dialogs don't stack.
+     */
+    @android.annotation.SuppressLint("BatteryLife")
+    private fun maybeAskToIgnoreBatteryOptimizations() {
+        val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (power.isIgnoringBatteryOptimizations(packageName)) return
+        val prefs = getSharedPreferences("battery_optimization", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("asked", false)) return
+        prefs.edit().putBoolean("asked", true).apply()
+        try {
+            startActivity(
+                Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    android.net.Uri.parse("package:$packageName")
+                )
+            )
+        } catch (e: android.content.ActivityNotFoundException) {
+            android.util.Log.w("MainActivity", "No screen to request the battery optimization exemption", e)
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -376,6 +405,7 @@ class MainActivity : ComponentActivity() {
         if (requestCode == 101) {
             // Restart NVR service to pick up newly granted camera/notification permissions
             startNvrService()
+            maybeAskToIgnoreBatteryOptimizations()
         }
     }
 }

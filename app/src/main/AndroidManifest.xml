@@ -21,6 +21,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- An NVR has to come back on its own after a reboot or an app update, and keep
+         running when the device idles -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:name=".FrigateApp"
         android:allowBackup="true"
@@ -47,6 +52,17 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="camera|dataSync" />
+
+        <!-- Restarts NvrService after a reboot or an app update, unless the user stopped
+             it. Both actions are protected broadcasts only the system can send. -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
     </application>
 
