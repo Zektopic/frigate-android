@@ -27,7 +27,7 @@ defaults:
 jobs:
   android:
     name: Android ${{ matrix.abi }}, OpenSSL ${{ matrix.openssl }}
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, manupa-hnx]
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -38,6 +38,9 @@ jobs:
       NDK_VERSION: 27.2.12479018  # r27c
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure Git safe directory
+        run: git config --global --add safe.directory '*'
 
       # Pinned rather than whatever the runner image ships, so a CMake major
       # upgrade can't turn a spike result into a toolchain question.
@@ -75,7 +78,7 @@ jobs:
 
   host:
     name: Host smoke test, OpenSSL ${{ matrix.openssl }}
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, manupa-hnx]
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -83,6 +86,9 @@ jobs:
         openssl: ['on', 'off']
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure Git safe directory
+        run: git config --global --add safe.directory '*'
 
       - name: Install CMake 3.31
         run: |

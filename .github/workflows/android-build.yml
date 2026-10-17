@@ -12,11 +12,14 @@ on:
 jobs:
   build:
     name: Build & Package APK
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, manupa-hnx]
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Configure Git safe directory
+        run: git config --global --add safe.directory '*'
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
