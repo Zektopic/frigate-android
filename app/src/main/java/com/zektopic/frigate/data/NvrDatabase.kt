@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [CameraConfigEntity::class, EventEntity::class, SystemConfigEntity::class], version = 3, exportSchema = false)
+@Database(entities = [CameraConfigEntity::class, EventEntity::class, SystemConfigEntity::class], version = 4, exportSchema = false)
 abstract class NvrDatabase : RoomDatabase() {
 
     abstract fun nvrDao(): NvrDao
@@ -31,6 +31,29 @@ abstract class NvrDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Review state for events: severity, the reviewed flag and an end time.
+         *
+         * Also clears two values earlier builds invented. Every event was stamped
+         * with the zone "Main Zone" although no zone existed, and the test
+         * notification button logged a "person, 96%, Gate Zone" event that never
+         * happened. Neither should survive into a Review page that filters by zone.
+         */
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE nvr_events ADD COLUMN severity TEXT NOT NULL DEFAULT 'alert'")
+                db.execSQL("ALTER TABLE nvr_events ADD COLUMN hasBeenReviewed INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE nvr_events ADD COLUMN endTime INTEGER")
+                // Everything recorded before this version has long since finished.
+                db.execSQL("UPDATE nvr_events SET endTime = timestamp")
+                db.execSQL(
+                    "DELETE FROM nvr_events WHERE label = 'person' AND zone = 'Gate Zone' " +
+                        "AND snapshotPath IS NULL AND videoPath IS NULL"
+                )
+                db.execSQL("UPDATE nvr_events SET zone = NULL WHERE zone = 'Main Zone'")
+            }
+        }
+
         fun getDatabase(context: Context): NvrDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -38,7 +61,7 @@ abstract class NvrDatabase : RoomDatabase() {
                     NvrDatabase::class.java,
                     "frigate_nvr_database"
                 )
-                .addMigrations(MIGRATION_2_3)
+                .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
                 .build()
                 INSTANCE = instance
                 instance

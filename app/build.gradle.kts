@@ -56,6 +56,23 @@ android {
     }
     testOptions {
         unitTests.isReturnDefaultValues = true
+        // Robolectric renders the screenshot tests and needs the merged resources.
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all { test ->
+            // Screenshots are rendered on request, not on every test run:
+            //   ./gradlew testDebugUnitTest -Pscreenshots
+            val screenshots = project.hasProperty("screenshots")
+            test.systemProperty("frigate.screenshots", screenshots.toString())
+            test.systemProperty("roborazzi.test.record", screenshots.toString())
+            test.systemProperty("frigate.screenshots.dir", rootProject.file("docs/screenshots").absolutePath)
+            if (screenshots) {
+                test.maxHeapSize = "2g"
+            } else {
+                // Even skipped, a Robolectric class makes the runner download its
+                // Android jar (~100 MB); keep that off ordinary test runs and CI.
+                test.exclude("**/ScreenshotTest*")
+            }
+        }
     }
     lint {
         // Lint is advisory in CI — unit tests and assembleDebug are the gates.
@@ -126,6 +143,12 @@ dependencies {
     testImplementation("org.mockito:mockito-core:5.8.0")
     testImplementation("org.mockito.kotlin:mockito-kotlin:5.2.1")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.0")
+    // Renders Compose screens to PNG on the JVM (see ScreenshotTest)
+    testImplementation("org.robolectric:robolectric:4.11.1")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi:1.11.0")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi-compose:1.11.0")
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 }

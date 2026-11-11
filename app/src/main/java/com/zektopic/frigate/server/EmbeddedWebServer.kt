@@ -17,6 +17,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
 import com.zektopic.frigate.service.NvrService
+import com.zektopic.frigate.util.CredentialRedactor
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import io.ktor.utils.io.*
 import java.io.ByteArrayOutputStream
 import android.graphics.Bitmap
@@ -30,6 +38,7 @@ class EmbeddedWebServer(
     private val recordingStore = com.zektopic.frigate.data.RecordingStore(context)
     private var server: NettyApplicationEngine? = null
     private val serverScope = CoroutineScope(Dispatchers.IO)
+    private val nvrService: NvrService? get() = context as? NvrService
 
     fun start() {
         if (server != null) return
@@ -43,56 +52,99 @@ class EmbeddedWebServer(
                     }
                     
                     routing {
-                        // Serve central beautiful single-page HTML console dashboard
                         get("/") {
-                            call.respondText(getWebConsoleHtml(), ContentType.Text.Html)
+                            call.respondText(webConsoleHtml(), ContentType.Text.Html)
                         }
 
-                        // API config GET endpoint
+                        // Credentials are masked on the way out. This endpoint has no
+                        // authentication, and camera passwords are worth more than the
+                        // convenience of reading them back over HTTP.
                         get("/api/config") {
-                            val config = nvrDao.getSystemConfig()
-                            val yamlString = config?.configYaml ?: ""
-                            call.respondText(yamlString, ContentType.Text.Plain)
+                            val yamlString = nvrDao.getSystemConfig()?.configYaml ?: ""
+                            call.respondText(CredentialRedactor.redact(yamlString), ContentType.Text.Plain)
                         }
 
-                        // API config POST endpoint
                         post("/api/config") {
-                            val yamlString = call.receiveText()
+                            val received = call.receiveText()
                             try {
-                                // Validate and parse the YAML
+                                // A client that edits what GET returned sends the masks
+                                // back; put the real credentials behind them again.
+                                val stored = nvrDao.getSystemConfig()?.configYaml ?: ""
+                                val yamlString = CredentialRedactor.restore(received, stored)
+                                if (CredentialRedactor.containsMask(yamlString)) {
+                                    call.respondText(
+                                        errorJson("A stream URL still contains masked credentials (*:*). Send the real username and password for any URL you change."),
+                                        ContentType.Application.Json, HttpStatusCode.BadRequest
+                                    )
+                                    return@post
+                                }
                                 val cameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlString)
-                                
-                                // Update database
-                                nvrDao.insertSystemConfig(com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlString))
-                                
-                                // Re-seed cameras database
-                                val existingCameras = nvrDao.getAllCameraConfigs()
-                                for (existing in existingCameras) {
-                                    nvrDao.deleteCameraConfig(existing)
-                                }
-                                for (camera in cameras) {
-                                    nvrDao.insertCameraConfig(camera)
-                                }
-                                
-                                call.respondText("{\"status\":\"success\",\"message\":\"Configuration updated and streams restarted.\"}", ContentType.Application.Json)
+                                // One transaction: the service must never observe the
+                                // camera table half-replaced, or it stops every stream.
+                                nvrDao.applyConfig(
+                                    com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlString),
+                                    cameras
+                                )
+                                call.respondText(
+                                    buildJsonObject {
+                                        put("status", "success")
+                                        put("message", "Configuration updated and streams restarted.")
+                                    }.toString(),
+                                    ContentType.Application.Json
+                                )
                             } catch (e: Exception) {
-                                call.respond(HttpStatusCode.BadRequest, "{\"status\":\"error\",\"message\":\"" + (e.message ?: "Invalid YAML") + "\"}")
+                                call.respondText(
+                                    errorJson(e.message ?: "Invalid YAML"),
+                                    ContentType.Application.Json, HttpStatusCode.BadRequest
+                                )
                             }
                         }
 
-                        // API status endpoint
                         get("/api/status") {
-                            val activeCameras = nvrDao.getAllCameraConfigs()
-                            val responseHtml = """
-                                {
-                                    "status": "active",
-                                    "cameras_count": ${activeCameras.size},
-                                    "monitored_feeds": [${activeCameras.joinToString(",") { "\"${it.name}\"" }}],
-                                    "engine": "Standard Motion Detector",
-                                    "inference_speed": "1ms"
-                                }
-                            """.trimIndent()
-                            call.respondText(responseHtml, ContentType.Application.Json)
+                            val cameras = nvrDao.getAllCameraConfigs()
+                            val states = nvrService?.streamStates?.value.orEmpty()
+                            call.respondText(
+                                buildJsonObject {
+                                    put("status", "active")
+                                    put("cameras_count", cameras.size)
+                                    put("cameras_live", cameras.count { states[it.id] == com.zektopic.frigate.media.StreamState.LIVE })
+                                    putJsonArray("monitored_feeds") { cameras.forEach { add(it.name) } }
+                                    put("engine", "Motion detector")
+                                }.toString(),
+                                ContentType.Application.Json
+                            )
+                        }
+
+                        // The same numbers the app's System page graphs.
+                        get("/api/stats") {
+                            val latest = nvrService?.stats?.value?.lastOrNull()
+                            val states = nvrService?.streamStates?.value.orEmpty()
+                            val cameras = nvrDao.getAllCameraConfigs()
+                            call.respondText(
+                                buildJsonObject {
+                                    putJsonObject("service") {
+                                        put("uptime", android.os.SystemClock.elapsedRealtime() / 1000)
+                                        put("cpu_percent", latest?.cpuPercent)
+                                        put("memory_percent", latest?.memoryPercent)
+                                        put("heap_mb", latest?.heapMb)
+                                        put("motion_ms", latest?.motionMs)
+                                    }
+                                    putJsonObject("cameras") {
+                                        for (camera in cameras) {
+                                            val stats = latest?.cameras?.get(camera.id)
+                                            putJsonObject(camera.id) {
+                                                put("name", camera.name)
+                                                put("state", states[camera.id]?.name ?: "STOPPED")
+                                                put("camera_fps", stats?.cameraFps)
+                                                put("detection_fps", stats?.detectFps)
+                                                put("skipped_fps", stats?.skippedFps)
+                                                put("motion_ms", stats?.motionMs)
+                                            }
+                                        }
+                                    }
+                                }.toString(),
+                                ContentType.Application.Json
+                            )
                         }
 
                         // Diagnostics: per-camera stream state, last decoder error, which
@@ -126,7 +178,7 @@ class EmbeddedWebServer(
                                 }
                                 """
                                 {
-                                  "id":"${esc(cam.id)}","name":"${esc(cam.name)}","url":"${esc(cam.rtspUrl)}",
+                                  "id":"${esc(cam.id)}","name":"${esc(cam.name)}","url":"${esc(CredentialRedactor.redact(cam.rtspUrl))}",
                                   "detectResolution":"${cam.detectWidth}x${cam.detectHeight}",
                                   "streamResolution":${jsonOrNull(profile?.let { "${it.width}x${it.height}" })},
                                   "state":"${esc(diag?.state ?: "UNKNOWN")}",
@@ -147,10 +199,10 @@ class EmbeddedWebServer(
                             }
                             // Raw dump of every sniffed stream so nothing is missed on URL mismatch
                             val rawSprop = com.zektopic.frigate.media.SpropCache.map.entries.joinToString(",") { (url, params) ->
-                                "\"${esc(url)}\":[${params.keys.sorted().joinToString(",") { "\"$it\"" }}]"
+                                "\"${esc(CredentialRedactor.redact(url))}\":[${params.keys.sorted().joinToString(",") { "\"$it\"" }}]"
                             }
                             val rawProfiles = com.zektopic.frigate.media.StreamProfileCache.map.entries
-                                .joinToString(",") { (url, p) -> "\"${esc(url)}\":\"${p.width}x${p.height}\"" }
+                                .joinToString(",") { (url, p) -> "\"${esc(CredentialRedactor.redact(url))}\":\"${p.width}x${p.height}\"" }
                             val budget = com.zektopic.frigate.media.DevicePerformance.cachedBudget()
                             // maxStreams is the device's own cap; effectiveMaxStreams is what
                             // runs after the config's android.max_concurrent_streams, if any.
@@ -158,6 +210,7 @@ class EmbeddedWebServer(
                             val budgetJson = if (budget == null) "null" else
                                 "{\"tier\":\"${budget.tier}\",\"maxStreams\":${budget.maxConcurrentStreams}," +
                                     "\"maxStreamsOverride\":${streamCap ?: "null"}," +
+                                    "\"lowResource\":${com.zektopic.frigate.media.DevicePerformance.lowResource}," +
                                     "\"effectiveMaxStreams\":${com.zektopic.frigate.media.DevicePerformance.effectiveMaxStreams(budget, streamCap)}," +
                                     "\"maxEncoders\":${budget.maxConcurrentEncoders}," +
                                     "\"detectFpsCap\":${budget.detectFpsCap}," +
@@ -199,41 +252,43 @@ class EmbeddedWebServer(
                             )
                         }
 
-                        // API events listings endpoint
                         get("/api/events") {
-                            val events = nvrDao.getPagedEvents(50, 0)
-                            val jsonArray = events.joinToString(",", prefix = "[", postfix = "]") { event ->
-                                """
-                                    {
-                                        "id": ${event.id},
-                                        "camera": "${event.cameraId}",
-                                        "label": "${event.label}",
-                                        "confidence": ${event.confidence},
-                                        "timestamp": ${event.timestamp},
-                                        "zone": "${event.zone ?: "All"}"
+                            val limit = call.request.queryParameters["limit"]?.toIntOrNull()?.coerceIn(1, 500) ?: 50
+                            val events = nvrDao.getPagedEvents(limit, 0)
+                            call.respondText(
+                                buildJsonArray {
+                                    for (event in events) addJsonObject {
+                                        put("id", event.id)
+                                        put("camera", event.cameraId)
+                                        put("label", event.label)
+                                        put("severity", event.severity)
+                                        put("timestamp", event.timestamp)
+                                        put("end_time", event.endTime)
+                                        put("has_been_reviewed", event.hasBeenReviewed)
+                                        putJsonArray("zones") { event.zones.forEach { add(it) } }
+                                        put("has_snapshot", event.snapshotPath != null)
+                                        put("has_clip", event.videoPath != null)
                                     }
-                                """.trimIndent()
-                            }
-                            call.respondText(jsonArray, ContentType.Application.Json)
+                                }.toString(),
+                                ContentType.Application.Json
+                            )
                         }
 
-                        // API snapshot endpoint
                         get("/api/events/{id}/snapshot") {
                             val eventId = call.parameters["id"]?.toLongOrNull()
                             if (eventId == null) {
                                 call.respond(HttpStatusCode.BadRequest, "Missing event ID parameter")
                                 return@get
                             }
-                            
-                            val events = nvrDao.getPagedEvents(100, 0)
-                            val matchingEvent = events.find { it.id == eventId }
-                            
-                            if (matchingEvent?.snapshotPath != null) {
+
+                            // By id, not by scanning the newest hundred: anything older
+                            // than that used to 404 while its snapshot was still on disk.
+                            val snapshotPath = nvrDao.getEventById(eventId)?.snapshotPath
+                            if (snapshotPath != null) {
                                 // Snapshots may live in a user-chosen folder (SD card, USB),
                                 // where they are document URIs rather than files — read them
                                 // through the store so both forms are served.
-                                val bytes = recordingStore.openInput(matchingEvent.snapshotPath)
-                                    ?.use { it.readBytes() }
+                                val bytes = recordingStore.openInput(snapshotPath)?.use { it.readBytes() }
                                 if (bytes != null) {
                                     call.respondBytes(bytes, ContentType.Image.JPEG)
                                 } else {
@@ -244,33 +299,41 @@ class EmbeddedWebServer(
                             }
                         }
 
-                        // API live stream endpoint
                         get("/api/{cameraName}/live.mjpeg") {
                             val cameraName = call.parameters["cameraName"]
                             if (cameraName == null) {
                                 call.respond(HttpStatusCode.BadRequest, "Missing cameraName parameter")
                                 return@get
                             }
-                            
-                            val camera = nvrDao.getAllCameraConfigs().find { it.name.lowercase() == cameraName.lowercase() || it.id.lowercase() == cameraName.lowercase() }
+
+                            val camera = nvrDao.getAllCameraConfigs().find {
+                                it.id.equals(cameraName, ignoreCase = true) || it.name.equals(cameraName, ignoreCase = true)
+                            }
                             if (camera == null) {
                                 call.respond(HttpStatusCode.NotFound, "Camera not found")
                                 return@get
                             }
-                            
-                            val service = this@EmbeddedWebServer.context as? NvrService
+
+                            val service = nvrService
                             if (service == null) {
                                 call.respond(HttpStatusCode.InternalServerError, "NVR service not available")
                                 return@get
                             }
 
                             call.respondBytesWriter(contentType = ContentType.parse("multipart/x-mixed-replace; boundary=frame")) {
-                                val intervalMs = 1000L / camera.fps
+                                // fps comes from the config; a zero there must not become
+                                // a division by zero on a request thread.
+                                val intervalMs = 1000L / camera.fps.coerceAtLeast(1)
+                                val out = ByteArrayOutputStream()
+                                var lastSent: Bitmap? = null
                                 try {
                                     while (true) {
                                         val bitmap = service.getLatestFrame(camera.id)
-                                        if (bitmap != null) {
-                                            val out = ByteArrayOutputStream()
+                                        // Encode only frames the client has not seen: a
+                                        // stalled camera should not cost a JPEG per tick.
+                                        if (bitmap != null && bitmap !== lastSent && !bitmap.isRecycled) {
+                                            lastSent = bitmap
+                                            out.reset()
                                             bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
                                             val jpegBytes = out.toByteArray()
 
@@ -286,7 +349,7 @@ class EmbeddedWebServer(
                                     }
                                 } catch (e: Exception) {
                                     // Client disconnected or stream stopped
-                                    Log.d("EmbeddedWebServer", "MJPEG stream disconnected for camera ${camera.name}: ${e.message}")
+                                    Log.d(tag, "MJPEG stream disconnected for camera ${camera.name}: ${e.message}")
                                 }
                             }
                         }
@@ -311,33 +374,31 @@ class EmbeddedWebServer(
         }
     }
 
-    private suspend fun getWebConsoleHtml(): String {
+    private fun errorJson(message: String): String =
+        buildJsonObject {
+            put("status", "error")
+            put("message", message)
+        }.toString()
+
+    private fun escapeHtml(text: String): String = text
+        .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace("\"", "&quot;").replace("'", "&#39;")
+
+    /**
+     * A small read-only console in the Frigate web UI's colours. Everything it shows
+     * is fetched from the API above; nothing on the page is a placeholder.
+     */
+    private suspend fun webConsoleHtml(): String {
         val cameras = nvrDao.getAllCameraConfigs()
-        val feedsHtml = if (cameras.isEmpty()) {
-            """
-            <div style="text-align: center; padding: 48px; background-color: #14141C; border: 1px dashed #222232; border-radius: 8px; color: #8E8E9C; grid-column: 1 / -1;">
-                <div style="font-size: 32px; margin-bottom: 8px;">📷</div>
-                <div style="font-weight: bold; color: #F5F5FA;">No Cameras Configured</div>
-                <div style="font-size: 12px; margin-top: 4px;">Please configure cameras in the Android app UI.</div>
-            </div>
-            """.trimIndent()
+        val tiles = if (cameras.isEmpty()) {
+            """<div class="empty">No cameras configured. Add one in the Android app.</div>"""
         } else {
             cameras.joinToString("\n") { camera ->
+                val id = java.net.URLEncoder.encode(camera.id, "UTF-8").replace("+", "%20")
                 """
-                <div class="feed-card">
-                    <div class="feed-header">
-                        <h3>${camera.name.uppercase()}</h3>
-                        <span class="badge">NVR ONLINE</span>
-                    </div>
-                    <div class="feed-monitor">
-                        <img src="/api/${camera.name}/live.mjpeg" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" />
-                        <div class="feed-placeholder" style="display: none; flex-direction: column; align-items: center; justify-content: center; color: #8E8E9C; height: 100%;">
-                            <div style="font-size: 32px; margin-bottom: 8px;">📷</div>
-                            <div style="font-weight: bold; color: #F5F5FA;">FEED OFFLINE</div>
-                        </div>
-                        <div style="position: absolute; bottom: 12px; left: 12px; font-size: 10px; color: #FF2A7A; font-weight: bold; background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 3px;">● REC</div>
-                        <div style="position: absolute; bottom: 12px; right: 12px; font-size: 10px; color: #8E8E9C; background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 3px;">${camera.fps} FPS | ${camera.detectWidth}x${camera.detectHeight}</div>
-                    </div>
+                <div class="tile">
+                    <img src="/api/$id/live.mjpeg" alt="" onerror="this.style.display='none'">
+                    <span class="chip">${escapeHtml(camera.name)}</span>
                 </div>
                 """.trimIndent()
             }
@@ -349,237 +410,104 @@ class EmbeddedWebServer(
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Frigate NVR Android Web Console</title>
+                <title>Frigate Android</title>
                 <style>
-                    body {
-                        background-color: #070709;
-                        color: #F5F5FA;
-                        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                        margin: 0;
-                        padding: 0;
-                    }
-                    header {
-                        background-color: #0D0D12;
-                        border-bottom: 1px solid #222232;
-                        padding: 16px 24px;
-                        display: flex;
-                        justify-content: space-between;
-                        align-items: center;
-                    }
-                    h1 {
-                        color: #00E5FF;
-                        font-size: 20px;
-                        margin: 0;
-                        letter-spacing: 2px;
-                        font-weight: 800;
-                    }
-                    .badge {
-                        background-color: rgba(0, 255, 178, 0.15);
-                        border: 1px solid #00FFB2;
-                        color: #00FFB2;
-                        padding: 4px 8px;
-                        border-radius: 4px;
-                        font-size: 11px;
-                        font-weight: bold;
-                    }
-                    main {
-                        max-width: 1200px;
-                        margin: 24px auto;
-                        padding: 0 16px;
-                        display: grid;
-                        grid-template-columns: 2fr 1fr;
-                        gap: 24px;
-                    }
-                    @media (max-width: 900px) {
-                        main {
-                            grid-template-columns: 1fr;
-                        }
-                    }
-                    .card {
-                        background-color: #14141C;
-                        border: 1px solid #222232;
-                        border-radius: 12px;
-                        padding: 20px;
-                        margin-bottom: 24px;
-                    }
-                    h2 {
-                        font-size: 16px;
-                        margin-top: 0;
-                        border-bottom: 1px solid #222232;
-                        padding-bottom: 10px;
-                        color: #F5F5FA;
-                    }
-                    .feed-grid {
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-                        gap: 16px;
-                    }
-                    .feed-card {
-                        background-color: #0F0F13;
-                        border: 1px solid #222232;
-                        border-radius: 8px;
-                        padding: 12px;
-                        display: flex;
-                        flex-direction: column;
-                    }
-                    .feed-header {
-                        display: flex;
-                        justify-content: space-between;
-                        align-items: center;
-                        margin-bottom: 8px;
-                    }
-                    .feed-card h3 {
-                        margin: 0;
-                        font-size: 13px;
-                        letter-spacing: 1px;
-                        color: #F5F5FA;
-                    }
-                    .feed-monitor {
-                        background-color: #050508;
-                        border: 1px solid #222232;
-                        border-radius: 6px;
-                        height: 200px;
-                        position: relative;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        overflow: hidden;
-                    }
-                    .feed-monitor::after {
-                        content: '';
-                        position: absolute;
-                        top: 0; left: 0; width: 100%; height: 100%;
-                        background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
-                        background-size: 100% 4px, 6px 100%;
-                        pointer-events: none;
-                    }
-                    .event-item {
-                        border-bottom: 1px solid #222232;
-                        padding: 12px 0;
-                        display: flex;
-                        justify-content: space-between;
-                        align-items: center;
-                    }
-                    .event-item:last-child {
-                        border-bottom: none;
-                    }
-                    .event-label {
-                        font-weight: bold;
-                        color: #00E5FF;
-                    }
-                    .event-details {
-                        font-size: 12px;
-                        color: #8E8E9C;
-                        margin-top: 4px;
-                    }
-                    .event-confidence {
-                        font-size: 16px;
-                        font-weight: 900;
-                        color: #00FFB2;
-                    }
-                    .diagnostic-grid {
-                        display: grid;
-                        grid-template-columns: repeat(3, 1fr);
-                        gap: 12px;
-                        text-align: center;
-                    }
-                    .metric-val {
-                        font-size: 24px;
-                        font-weight: 900;
-                        color: #00E5FF;
-                    }
-                    .metric-lbl {
-                        font-size: 10px;
-                        color: #8E8E9C;
-                        text-transform: uppercase;
-                        margin-top: 4px;
-                    }
+                    :root { color-scheme: dark; }
+                    body { margin: 0; background: #000; color: #fff; font: 14px/1.4 Inter, system-ui, sans-serif; }
+                    header { display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 16px;
+                             background: #171717; border-bottom: 1px solid #404040; }
+                    header b { font-weight: 600; }
+                    header span { color: #6b6b6b; font-size: 12px; }
+                    main { padding: 12px; display: grid; gap: 16px; grid-template-columns: minmax(0, 3fr) minmax(240px, 1fr); }
+                    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+                    h2 { margin: 0 0 8px; font-size: 14px; font-weight: 500; color: #6b6b6b; }
+                    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+                    .tile { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: 16px;
+                            overflow: hidden; outline: 1px solid #262626; }
+                    .tile img { width: 100%; height: 100%; object-fit: cover; }
+                    .chip { position: absolute; top: 8px; right: 8px; padding: 2px 8px; border-radius: 16px;
+                            font-size: 12px; background: linear-gradient(to bottom right, #9ca3af, #6b7280); }
+                    .card { background: #171717; border-radius: 16px; padding: 10px; margin-bottom: 16px; }
+                    .row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0;
+                           border-bottom: 1px solid #262626; font-size: 13px; }
+                    .row:last-child { border-bottom: 0; }
+                    .muted { color: #6b6b6b; }
+                    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
+                    .alert { background: #991b1b; } .detection { background: #ea580c; }
+                    .empty { color: #6b6b6b; padding: 32px; text-align: center; grid-column: 1 / -1; }
                 </style>
             </head>
             <body>
-                <header>
-                    <h1>FRIGATE ANDROID CONSOLE</h1>
-                    <span class="badge">NVR ONLINE</span>
-                </header>
+                <header><b>Frigate Android</b><span id="summary"></span></header>
                 <main>
-                    <div>
-                        <div class="card">
-                            <h2>LIVE SYSTEM PREVIEWS</h2>
-                            <div class="feed-grid">
-                                $feedsHtml
-                            </div>
-                        </div>
- 
-                        <div class="card">
-                            <h2>SYSTEM DIAGNOSTICS</h2>
-                            <div class="diagnostic-grid">
-                                <div>
-                                    <div class="metric-val">1ms</div>
-                                    <div class="metric-lbl">Analysis Latency</div>
-                                </div>
-                                <div>
-                                    <div class="metric-val">5.0 FPS</div>
-                                    <div class="metric-lbl">Processing Speed</div>
-                                </div>
-                                <div>
-                                    <div class="metric-val">CPU</div>
-                                    <div class="metric-lbl">Detection Engine</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
- 
-                    <div>
-                        <div class="card">
-                            <h2>RECENT DETECTION EVENTS</h2>
-                            <div id="events-list">
-                                <div class="event-item">
-                                    <div>
-                                        <div class="event-label">PERSON detected</div>
-                                        <div class="event-details">Camera: front_camera • Zone: Gate</div>
-                                    </div>
-                                    <div class="event-confidence">96%</div>
-                                </div>
-                                <div class="event-item">
-                                    <div>
-                                        <div class="event-label">CAR detected</div>
-                                        <div class="event-details">Camera: back_garden • Zone: Garden Entry</div>
-                                    </div>
-                                    <div class="event-confidence">84%</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
+                    <section>
+                        <h2>Live</h2>
+                        <div class="grid">$tiles</div>
+                    </section>
+                    <aside>
+                        <h2>System</h2>
+                        <div class="card" id="stats"><div class="muted">Loading…</div></div>
+                        <h2>Review</h2>
+                        <div class="card" id="events"><div class="muted">Loading…</div></div>
+                    </aside>
                 </main>
                 <script>
-                    // Periodically poll events list from the local REST API
-                    async function fetchEvents() {
-                        try {
-                            const res = await fetch('/api/events');
-                            if (res.ok) {
-                                const events = await res.json();
-                                if (events.length > 0) {
-                                    const container = document.getElementById('events-list');
-                                    container.innerHTML = '';
-                                    events.forEach(event => {
-                                        const time = new Date(event.timestamp).toLocaleTimeString();
-                                        container.innerHTML += `
-                                            <div class="event-item">
-                                                <div>
-                                                    <div class="event-label">${'$'}{event.label.toUpperCase()} detected</div>
-                                                    <div class="event-details">Camera: ${'$'}{event.camera} • ${'$'}{time}</div>
-                                                </div>
-                                                <div class="event-confidence">${'$'}{Math.round(event.confidence * 100)}%</div>
-                                            </div>
-                                        `;
-                                    });
-                                }
-                            }
-                        } catch (e) {
-                            console.error("Failed to fetch events from API", e);
+                    // Rows are built with textContent only: camera names and labels come
+                    // from user configuration and must never be parsed as markup.
+                    function row(left, right, dotClass) {
+                        const el = document.createElement('div');
+                        el.className = 'row';
+                        const a = document.createElement('span');
+                        if (dotClass) {
+                            const dot = document.createElement('span');
+                            dot.className = 'dot ' + dotClass;
+                            a.appendChild(dot);
+                        }
+                        a.appendChild(document.createTextNode(left));
+                        const b = document.createElement('span');
+                        b.className = 'muted';
+                        b.textContent = right;
+                        el.append(a, b);
+                        return el;
+                    }
+                    function fill(id, rows, emptyText) {
+                        const box = document.getElementById(id);
+                        box.replaceChildren();
+                        if (rows.length === 0) {
+                            const el = document.createElement('div');
+                            el.className = 'muted';
+                            el.textContent = emptyText;
+                            box.appendChild(el);
+                        } else {
+                            rows.forEach(r => box.appendChild(r));
                         }
                     }
-                    setInterval(fetchEvents, 3000);
+                    const fmt = (v, unit) => v == null ? '—' : v.toFixed(1) + unit;
+                    async function refresh() {
+                        try {
+                            const stats = await (await fetch('/api/stats')).json();
+                            const cams = Object.values(stats.cameras);
+                            const live = cams.filter(c => c.state === 'LIVE').length;
+                            document.getElementById('summary').textContent = live + ' of ' + cams.length + ' cameras live';
+                            const rows = [
+                                row('CPU', fmt(stats.service.cpu_percent, '%')),
+                                row('Memory', fmt(stats.service.memory_percent, '%')),
+                                row('Motion detection', fmt(stats.service.motion_ms, ' ms'))
+                            ];
+                            cams.forEach(c => rows.push(row(c.name, c.state === 'LIVE' ? fmt(c.camera_fps, ' fps') : c.state.toLowerCase())));
+                            fill('stats', rows, '');
+                        } catch (e) { /* the next tick retries */ }
+                        try {
+                            const events = await (await fetch('/api/events?limit=20')).json();
+                            fill('events', events.map(e => row(
+                                e.camera.replace(/_/g, ' ') + (e.zones.length ? ' · ' + e.zones.join(', ') : ''),
+                                new Date(e.timestamp).toLocaleTimeString(),
+                                e.severity
+                            )), 'No events yet');
+                        } catch (e) { /* the next tick retries */ }
+                    }
+                    refresh();
+                    setInterval(refresh, 3000);
                 </script>
             </body>
             </html>

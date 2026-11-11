@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.graphics.Bitmap
 import android.os.Binder
 import android.os.IBinder
 import android.util.Log
@@ -13,20 +14,51 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import com.zektopic.frigate.FrigateApp
 import com.zektopic.frigate.MainActivity
+import com.zektopic.frigate.ai.MotionBox
+import com.zektopic.frigate.ai.MotionConfig
+import com.zektopic.frigate.ai.MotionDetector
+import com.zektopic.frigate.data.AppPreferences
 import com.zektopic.frigate.data.CameraConfigEntity
+import com.zektopic.frigate.data.CameraRuntimeConfig
+import com.zektopic.frigate.data.EventEntity
+import com.zektopic.frigate.data.NotificationSettings
 import com.zektopic.frigate.data.NvrDao
+import com.zektopic.frigate.data.RecordingJanitor
+import com.zektopic.frigate.data.RecordingStore
+import com.zektopic.frigate.data.ReviewRules
+import com.zektopic.frigate.data.ReviewSeverity
+import com.zektopic.frigate.data.YamlConfigParser
+import com.zektopic.frigate.media.ClipRecorder
 import com.zektopic.frigate.media.DevicePerformance
+import com.zektopic.frigate.media.StreamDiagnostics
 import com.zektopic.frigate.media.StreamIngester
 import com.zektopic.frigate.media.StreamState
+import com.zektopic.frigate.notification.AlertManager
+import com.zektopic.frigate.server.EmbeddedWebServer
+import com.zektopic.frigate.ui.settings.CameraFeatures
+import com.zektopic.frigate.ui.settings.CameraYamlEditor
 import dagger.hilt.android.AndroidEntryPoint
-import android.graphics.Bitmap
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -39,20 +71,20 @@ class NvrService : Service(), LifecycleOwner {
     private val activeIngesters = mutableMapOf<String, StreamIngester>()
     private val lifecycleRegistry = LifecycleRegistry(this)
 
-    // Motion variables
-    private val motionDetectors = mutableMapOf<String, com.zektopic.frigate.ai.MotionDetector>()
-    private val lastEventTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
-    private val lastFrameProcessTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    /** A camera's detector together with the config it was built from. */
+    private class DetectorSlot(val config: MotionConfig, val detector: MotionDetector)
 
-    // Per-camera in-flight guard for the AI pipeline. The time throttle below limits
+    private val motionDetectors = ConcurrentHashMap<String, DetectorSlot>()
+    private val lastFrameProcessTime = ConcurrentHashMap<String, Long>()
+
+    // Per-camera in-flight guard for the motion pipeline. The time throttle below limits
     // dispatch rate, not completion, so a slow frame would otherwise keep queueing
     // coroutines (each retaining a detect-resolution bitmap) on Dispatchers.Default.
     // Drop the new frame instead — same policy as _frameFlow's DROP_OLDEST.
-    private val frameProcessInFlight =
-        java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
+    private val frameProcessInFlight = ConcurrentHashMap<String, AtomicBoolean>()
 
     // Live Frame flow and cache
-    private val latestFramesMap = java.util.concurrent.ConcurrentHashMap<String, Bitmap>()
+    private val latestFramesMap = ConcurrentHashMap<String, Bitmap>()
     private val _frameFlow = MutableSharedFlow<Pair<String, Bitmap>>(
         replay = 0,
         extraBufferCapacity = 1,
@@ -64,26 +96,71 @@ class NvrService : Service(), LifecycleOwner {
     private val _streamStates = MutableStateFlow<Map<String, StreamState>>(emptyMap())
     val streamStates = _streamStates.asStateFlow()
 
-    fun getLatestFrame(cameraId: String): Bitmap? {
-        return latestFramesMap[cameraId]
-    }
+    /** Cameras with motion right now; drives the pulsing dot on a live tile. */
+    private val _activeMotion = MutableStateFlow<Set<String>>(emptySet())
+    val activeMotion = _activeMotion.asStateFlow()
+
+    /** Cameras with an alert in progress; drives the red outline on a live tile. */
+    private val _activeAlerts = MutableStateFlow<Set<String>>(emptySet())
+    val activeAlerts = _activeAlerts.asStateFlow()
+
+    /** Cameras configured and enabled but not running because the device budget is spent. */
+    private val _camerasOverBudget = MutableStateFlow<List<String>>(emptyList())
+    val camerasOverBudget = _camerasOverBudget.asStateFlow()
+
+    /**
+     * Whether the NVR is actually running. Not the same as the service existing: the
+     * activity binds with BIND_AUTO_CREATE, so the service is alive whenever the app
+     * is on screen, started or not.
+     */
+    private val _running = MutableStateFlow(false)
+    val running = _running.asStateFlow()
+
+    private val _stats = MutableStateFlow<List<StatsSample>>(emptyList())
+    val stats = _stats.asStateFlow()
+    private val statsCollector = StatsCollector()
+
+    private val lastMotionAt = ConcurrentHashMap<String, Long>()
+    private val latestMotionBoxes = ConcurrentHashMap<String, List<MotionBox>>()
+
+    fun getLatestFrame(cameraId: String): Bitmap? = latestFramesMap[cameraId]
+
+    /** Boxes from the most recent analysed frame, in that frame's pixels. Empty when still. */
+    fun getMotionBoxes(cameraId: String): List<MotionBox> = latestMotionBoxes[cameraId].orEmpty()
 
     // Embedded Ktor Web Server
-    private var webServer: com.zektopic.frigate.server.EmbeddedWebServer? = null
+    private var webServer: EmbeddedWebServer? = null
 
     // Motion-triggered clip recording
-    private lateinit var clipRecorder: com.zektopic.frigate.media.ClipRecorder
-    private lateinit var recordingJanitor: com.zektopic.frigate.data.RecordingJanitor
-    private val cameraById = java.util.concurrent.ConcurrentHashMap<String, CameraConfigEntity>()
-    private val activeEventIdByCamera = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private lateinit var clipRecorder: ClipRecorder
+    private lateinit var recordingJanitor: RecordingJanitor
+    private lateinit var alertManager: AlertManager
+    private val cameraById = ConcurrentHashMap<String, CameraConfigEntity>()
 
-    // Live per-camera feature toggles (detect/record/snapshots), parsed from the
-    // persisted YAML so the tile switches genuinely gate downstream behavior.
-    @Volatile private var cameraFeatures: Map<String, com.zektopic.frigate.ui.settings.CameraFeatures> = emptyMap()
+    /**
+     * The event currently open for a camera. One event spans one stretch of activity:
+     * further motion extends it instead of logging a new row every ten seconds, which
+     * is what used to leave all but the last of those rows without a clip.
+     */
+    private class ActiveEvent(
+        val id: Long,
+        @Volatile var lastMotionAt: Long,
+        @Volatile var severity: ReviewSeverity,
+        @Volatile var zones: Set<String>
+    )
+
+    private val activeEvents = ConcurrentHashMap<String, ActiveEvent>()
+
+    // Live per-camera feature toggles (detect/record/snapshots) and the motion, zone
+    // and review settings, all parsed from the persisted YAML.
+    @Volatile private var cameraFeatures: Map<String, CameraFeatures> = emptyMap()
+    @Volatile private var runtimeConfigs: Map<String, CameraRuntimeConfig> = emptyMap()
 
     // Notification preferences, cached from DataStore so alert gating is enforced.
-    private lateinit var appPreferences: com.zektopic.frigate.data.AppPreferences
-    @Volatile private var notificationSettings = com.zektopic.frigate.data.NotificationSettings()
+    private lateinit var appPreferences: AppPreferences
+    @Volatile private var notificationSettings = NotificationSettings()
+
+    private var configJob: Job? = null
 
     @Inject
     lateinit var nvrDao: NvrDao
@@ -92,38 +169,43 @@ class NvrService : Service(), LifecycleOwner {
         super.onCreate()
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
 
-        clipRecorder = com.zektopic.frigate.media.ClipRecorder(this, nvrDao)
-        recordingJanitor = com.zektopic.frigate.data.RecordingJanitor(
-            com.zektopic.frigate.data.RecordingStore(applicationContext), nvrDao
-        )
+        clipRecorder = ClipRecorder(this, nvrDao)
+        recordingJanitor = RecordingJanitor(RecordingStore(applicationContext), nvrDao)
+        alertManager = AlertManager(applicationContext)
 
         // Cache notification preferences so alert gating is enforced at post time
-        appPreferences = com.zektopic.frigate.data.AppPreferences(applicationContext)
+        appPreferences = AppPreferences(applicationContext)
         serviceScope.launch {
             appPreferences.notificationSettings.collect { notificationSettings = it }
         }
 
-        // Cache per-camera live feature toggles parsed from the persisted YAML
+        // Cache everything the frame path reads from the persisted YAML
         serviceScope.launch {
             nvrDao.getSystemConfigFlow().collect { config ->
-                cameraFeatures = config?.configYaml?.let {
-                    try { com.zektopic.frigate.ui.settings.CameraYamlEditor.readAllCameraFeatures(it) }
-                    catch (e: Exception) { emptyMap() }
+                val yaml = config?.configYaml
+                cameraFeatures = yaml?.let {
+                    try { CameraYamlEditor.readAllCameraFeatures(it) } catch (e: Exception) { emptyMap() }
+                } ?: emptyMap()
+                runtimeConfigs = yaml?.let {
+                    try { YamlConfigParser.parseRuntimeConfigs(it) } catch (e: Exception) { emptyMap() }
                 } ?: emptyMap()
             }
         }
 
-        // Periodically finalize idle recordings and attach the clip to its event
+        // A process killed mid-recording leaves its events open with no clip coming.
+        serviceScope.launch {
+            try {
+                nvrDao.closeStaleEvents(System.currentTimeMillis() - STALE_EVENT_MS)
+            } catch (e: Exception) {
+                Log.e(tag, "Could not close stale events", e)
+            }
+        }
+
+        // Periodically finalize idle recordings and close out their events
         serviceScope.launch {
             while (isActive) {
-                kotlinx.coroutines.delay(2000)
-                for ((cameraId, path) in clipRecorder.reapIdleSessions()) {
-                    activeEventIdByCamera.remove(cameraId)?.let { eventId ->
-                        try { nvrDao.updateEventVideoPath(eventId, path) } catch (e: Exception) {
-                            Log.e(tag, "Failed to attach clip to event", e)
-                        }
-                    }
-                }
+                delay(REAP_INTERVAL_MS)
+                reapFinishedActivity()
             }
         }
 
@@ -133,12 +215,14 @@ class NvrService : Service(), LifecycleOwner {
         serviceScope.launch(Dispatchers.IO) {
             while (isActive) {
                 recordingJanitor.sweep()
-                kotlinx.coroutines.delay(60_000)
+                delay(60_000)
             }
         }
 
+        serviceScope.launch { sampleStats() }
+
         // Initialize and start embedded Ktor web server
-        webServer = com.zektopic.frigate.server.EmbeddedWebServer(this, nvrDao)
+        webServer = EmbeddedWebServer(this, nvrDao)
         webServer?.start()
 
         Log.i(tag, "NVR Foreground Service created. Web Server initialized.")
@@ -146,46 +230,70 @@ class NvrService : Service(), LifecycleOwner {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
-        
+        _running.value = true
+
         // Show persistent status notification to run in background
         enterForeground(createStatusNotification("Initializing NVR streams..."))
 
-        // Observe database configurations flow and launch/reload streams dynamically
-        serviceScope.launch {
-            try {
-                @OptIn(kotlinx.coroutines.FlowPreview::class)
-                nvrDao.getAllCameraConfigsFlow().debounce(500L).collect { cameras ->
-                    val activeCameras = cameras.filter { it.isEnabled }
-                    // Read with the cameras rather than from its own flow, so a config
-                    // change that touches both is admitted in one pass.
-                    val streamCap = nvrDao.getSystemConfig()?.configYaml
-                        ?.let { com.zektopic.frigate.data.YamlConfigParser.parseMaxConcurrentStreams(it) }
-                    withContext(Dispatchers.Main) {
-                        if (activeCameras.isEmpty()) {
-                            updateNotification("No active cameras configured. Configure in App UI.")
-                            synchronized(activeIngesters) {
-                                for (ingester in activeIngesters.values) {
-                                    ingester.stop()
-                                }
-                                activeIngesters.clear()
-                                motionDetectors.clear()
-                                _streamStates.value = emptyMap()
-                            }
-                        } else {
-                            updateNotification("Monitoring ${activeCameras.size} active camera stream(s)")
-                            startActiveStreams(activeCameras, streamCap)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(tag, "Failed to load camera configurations flow in service", e)
-                withContext(Dispatchers.Main) {
-                    updateNotification("Error starting streams: ${e.message}")
-                }
-            }
+        // onStartCommand runs on every startForegroundService call, and the activity
+        // makes one each time it opens. Each call used to add another collector, all
+        // racing to restart the same streams.
+        if (configJob?.isActive != true) {
+            configJob = serviceScope.launch { observeConfig() }
         }
 
         return START_STICKY
+    }
+
+    /**
+     * Stop watching cameras. Must be called on the main thread.
+     *
+     * `stopService` alone does nothing while the activity is bound: Android keeps a
+     * bound service alive, so the streams kept running behind a UI that said they
+     * had stopped. This tears the pipeline down itself and then lets go.
+     */
+    fun stopNvr() {
+        if (!_running.value) return
+        _running.value = false
+        Log.i(tag, "Stopping NVR on request")
+        configJob?.cancel()
+        configJob = null
+        stopAllStreams()
+        val saved = clipRecorder.stopAll()
+        serviceScope.launch { closeAllEvents(saved) }
+        _stats.value = emptyList()
+        androidx.core.app.ServiceCompat.stopForeground(this, androidx.core.app.ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /** Observe the camera table and the config together, and (re)start streams to match. */
+    @OptIn(FlowPreview::class)
+    private suspend fun observeConfig() {
+        try {
+            nvrDao.getAllCameraConfigsFlow()
+                .combine(nvrDao.getSystemConfigFlow()) { cameras, config -> cameras to config?.configYaml }
+                .debounce(500L)
+                .collect { (cameras, yaml) ->
+                    val activeCameras = cameras.filter { it.isEnabled }
+                    val streamCap = yaml?.let { YamlConfigParser.parseMaxConcurrentStreams(it) }
+                    val lowResource = yaml?.let { YamlConfigParser.parseLowResource(it) } ?: false
+                    withContext(Dispatchers.Main) {
+                        if (activeCameras.isEmpty()) {
+                            updateNotification("No active cameras configured. Configure in App UI.")
+                            stopAllStreams()
+                        } else {
+                            startActiveStreams(activeCameras, streamCap, lowResource)
+                        }
+                    }
+                }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to load camera configurations flow in service", e)
+            withContext(Dispatchers.Main) {
+                updateNotification("Error starting streams: ${e.message}")
+            }
+        }
     }
 
     /**
@@ -223,8 +331,16 @@ class NvrService : Service(), LifecycleOwner {
     override fun onDestroy() {
         Log.i(tag, "NVR Foreground Service destroying...")
 
-        // Finalize any in-progress recordings before tearing down
-        try { clipRecorder.stopAll() } catch (e: Exception) { Log.e(tag, "Error stopping recordings", e) }
+        // Finalize any in-progress recordings and attach each to its event. Bounded:
+        // this is the main thread, and a stuck database must not turn shutdown into an ANR.
+        try {
+            val saved = clipRecorder.stopAll()
+            runBlocking(Dispatchers.IO) {
+                withTimeoutOrNull(1_500L) { closeAllEvents(saved) }
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Error stopping recordings", e)
+        }
 
         serviceScope.cancel()
 
@@ -239,8 +355,8 @@ class NvrService : Service(), LifecycleOwner {
 
         // Release resources
         motionDetectors.clear()
-        lastEventTime.clear()
         latestFramesMap.clear()
+        latestMotionBoxes.clear()
 
         // Stop web server
         webServer?.stop()
@@ -250,25 +366,64 @@ class NvrService : Service(), LifecycleOwner {
         super.onDestroy()
     }
 
-    // Signatures of the cameras last admitted, to avoid unnecessary restarts
+    // What was last admitted, to avoid unnecessary restarts
     private var lastAdmittedSignatures: Set<String> = emptySet()
+    private var lastLowResource = false
+
+    private fun stopAllStreams() {
+        synchronized(activeIngesters) {
+            for (ingester in activeIngesters.values) ingester.stop()
+            activeIngesters.clear()
+            resetPerStreamState()
+            lastAdmittedSignatures = emptySet()
+        }
+        _camerasOverBudget.value = emptyList()
+    }
+
+    /** Must be called holding [activeIngesters]. */
+    private fun resetPerStreamState() {
+        motionDetectors.clear()
+        cameraById.clear()
+        // Drop in-flight markers with the ingesters that set them; a stale `true`
+        // would permanently gate the new ingester for that camera.
+        frameProcessInFlight.clear()
+        // Drop cached frames with the ingesters that produced them. Not recycled:
+        // Compose and the MJPEG endpoint may still be holding one, and a recycled
+        // Bitmap under them is a crash. Releasing the reference is enough to stop
+        // a removed camera's full-resolution frame living for the service's life.
+        latestFramesMap.clear()
+        latestMotionBoxes.clear()
+        lastMotionAt.clear()
+        _streamStates.value = emptyMap()
+        _activeMotion.value = emptySet()
+    }
 
     /**
      * @param streamCap the config's `android.max_concurrent_streams`, or null to let
      *   the device budget decide how many of [cameras] to run.
      */
-    private fun startActiveStreams(cameras: List<CameraConfigEntity>, streamCap: Int?) {
+    private fun startActiveStreams(cameras: List<CameraConfigEntity>, streamCap: Int?, lowResource: Boolean) {
+        DevicePerformance.lowResource = lowResource
         val budget = DevicePerformance.budget(this)
         val cap = DevicePerformance.effectiveMaxStreams(budget, streamCap)
         DevicePerformance.streamCapOverride = streamCap
         val admitted = cameras.take(cap)
+        _camerasOverBudget.value = cameras.drop(cap).map { it.name }
+
+        updateNotification(
+            if (admitted.size < cameras.size) "Monitoring ${admitted.size} of ${cameras.size} cameras (device limit)"
+            else "Monitoring ${admitted.size} active camera stream(s)"
+        )
 
         // Compare what would actually run. Comparing every configured camera against
         // the running ingesters never matched while the cap left some out, so every
         // emission restarted every stream; comparing the admitted set also restarts
         // when only the cap changes.
         val admittedSignatures = admitted.map { configSignature(it) }.toSet()
-        if (admittedSignatures == lastAdmittedSignatures && activeIngesters.size == admitted.size) {
+        if (admittedSignatures == lastAdmittedSignatures &&
+            activeIngesters.size == admitted.size &&
+            lowResource == lastLowResource
+        ) {
             Log.d(tag, "Camera configs unchanged, skipping stream restart.")
             return
         }
@@ -284,6 +439,7 @@ class NvrService : Service(), LifecycleOwner {
 
         Log.i(tag, "Camera configs changed. Restarting ${admitted.size} stream(s)...")
         lastAdmittedSignatures = admittedSignatures
+        lastLowResource = lowResource
 
         val pending = mutableListOf<StreamIngester>()
         synchronized(activeIngesters) {
@@ -292,55 +448,16 @@ class NvrService : Service(), LifecycleOwner {
                 ingester.stop()
             }
             activeIngesters.clear()
-            motionDetectors.clear()
-            cameraById.clear()
-            // Drop in-flight markers with the ingesters that set them; a stale `true`
-            // would permanently gate the new ingester for that camera.
-            frameProcessInFlight.clear()
-            // Drop cached frames with the ingesters that produced them. Not recycled:
-            // Compose and the MJPEG endpoint may still be holding one, and a recycled
-            // Bitmap under them is a crash. Releasing the reference is enough to stop
-            // a removed camera's full-resolution frame living for the service's life.
-            latestFramesMap.clear()
-            _streamStates.value = emptyMap()
+            resetPerStreamState()
 
             // Initialize new ingesters
             for (camera in admitted) {
-                // Initialize a motion detector for this camera with specific thresholds
-                motionDetectors[camera.id] = com.zektopic.frigate.ai.MotionDetector(camera.motionThreshold)
                 cameraById[camera.id] = camera
 
                 val ingester = StreamIngester(
                     this,
                     camera,
-                    onFrameExtracted = { frameBitmap ->
-                        // Cache frame and emit for Compose/Ktor clients
-                        latestFramesMap[camera.id] = frameBitmap
-                        _frameFlow.tryEmit(Pair(camera.id, frameBitmap))
-
-                        // Feed any in-progress motion recording for this camera
-                        clipRecorder.offerFrame(camera.id, frameBitmap)
-
-                        // Route frame through the gated AI pipeline in a background thread
-                        // (throttled to 5 FPS per camera max, and at most one in flight)
-                        val now = System.currentTimeMillis()
-                        val lastProc = lastFrameProcessTime[camera.id] ?: 0L
-                        if (now - lastProc >= 200L) {
-                            val inFlight = frameProcessInFlight.getOrPut(camera.id) {
-                                java.util.concurrent.atomic.AtomicBoolean(false)
-                            }
-                            if (inFlight.compareAndSet(false, true)) {
-                                lastFrameProcessTime[camera.id] = now
-                                serviceScope.launch(Dispatchers.Default) {
-                                    try {
-                                        processIncomingFrame(camera.id, frameBitmap)
-                                    } finally {
-                                        inFlight.set(false)
-                                    }
-                                }
-                            }
-                        }
-                    },
+                    onFrameExtracted = { frameBitmap -> onFrame(camera, frameBitmap) },
                     onStateChanged = { state ->
                         _streamStates.update { it + (camera.id to state) }
                     }
@@ -363,6 +480,39 @@ class NvrService : Service(), LifecycleOwner {
         }
     }
 
+    /** Runs on the stream's frame-extraction thread: must never block. */
+    private fun onFrame(camera: CameraConfigEntity, frame: Bitmap) {
+        // Cache frame and emit for Compose/Ktor clients
+        latestFramesMap[camera.id] = frame
+        _frameFlow.tryEmit(Pair(camera.id, frame))
+
+        // Feed any in-progress motion recording for this camera
+        clipRecorder.offerFrame(camera.id, frame)
+
+        // Route the frame through motion detection on a background thread, throttled
+        // to 5 FPS per camera and with at most one frame in flight.
+        val now = System.currentTimeMillis()
+        val lastProc = lastFrameProcessTime[camera.id] ?: 0L
+        if (now - lastProc < MIN_DETECT_INTERVAL_MS) return
+        val inFlight = frameProcessInFlight.getOrPut(camera.id) { AtomicBoolean(false) }
+        if (!inFlight.compareAndSet(false, true)) {
+            statsCollector.onFrameSkipped(camera.id)
+            return
+        }
+        lastFrameProcessTime[camera.id] = now
+        serviceScope.launch(Dispatchers.Default) {
+            try {
+                processIncomingFrame(camera.id, frame)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(tag, "Motion pipeline failed for ${camera.id}", e)
+            } finally {
+                inFlight.set(false)
+            }
+        }
+    }
+
     /**
      * Android's warning shot before the low-memory killer. Previously unimplemented,
      * which meant the app's only response to memory pressure was to be killed - the
@@ -376,7 +526,8 @@ class NvrService : Service(), LifecycleOwner {
             level >= TRIM_MEMORY_RUNNING_CRITICAL -> {
                 Log.w(tag, "Memory critical (level=$level): dropping frame cache and stopping recordings")
                 latestFramesMap.clear()
-                clipRecorder.stopAll()
+                val saved = clipRecorder.stopAll()
+                serviceScope.launch { closeAllEvents(saved) }
             }
             level >= TRIM_MEMORY_RUNNING_LOW -> {
                 Log.w(tag, "Memory low (level=$level): dropping cached frames")
@@ -387,83 +538,158 @@ class NvrService : Service(), LifecycleOwner {
 
     private fun configSignature(c: CameraConfigEntity): String {
         return "${c.id}|${c.name}|${c.rtspUrl}|${c.detectRtspUrl}|${c.isEnabled}|" +
-            "${c.detectWidth}|${c.detectHeight}|${c.fps}|${c.motionThreshold}"
+            "${c.detectWidth}|${c.detectHeight}|${c.fps}"
     }
 
-    private suspend fun processIncomingFrame(cameraId: String, bitmap: android.graphics.Bitmap) {
-        val motionDetector = motionDetectors[cameraId] ?: return
+    /** The camera's detector, rebuilt when its motion settings change in the config. */
+    private fun detectorFor(cameraId: String, config: MotionConfig): MotionDetector {
+        val slot = motionDetectors[cameraId]
+        if (slot != null && slot.config == config) return slot.detector
+        return MotionDetector(config).also { motionDetectors[cameraId] = DetectorSlot(config, it) }
+    }
+
+    private suspend fun processIncomingFrame(cameraId: String, bitmap: Bitmap) {
+        val camera = cameraById[cameraId] ?: return
+        val runtime = runtimeConfigs[cameraId] ?: DEFAULT_RUNTIME
 
         // Per-camera live toggles (default all-on when a camera has no flags yet)
-        val features = cameraFeatures[cameraId] ?: com.zektopic.frigate.ui.settings.CameraFeatures()
+        val features = cameraFeatures[cameraId] ?: CameraFeatures()
 
-        // 1. Run low-power motion detection pre-filter
-        val hasMotion = motionDetector.detectMotion(bitmap)
-        if (!hasMotion) return
+        // 1. Motion detection against the running background model
+        val startedAt = System.nanoTime()
+        val result = detectorFor(cameraId, runtime.motion).detect(bitmap)
+        statsCollector.onFrameProcessed(cameraId, System.nanoTime() - startedAt)
+
+        latestMotionBoxes[cameraId] = if (result.hasMotion) result.boxes else emptyList()
+        if (!result.hasMotion) return
+
+        val now = System.currentTimeMillis()
+        lastMotionAt[cameraId] = now
+        if (cameraId !in _activeMotion.value) _activeMotion.update { it + cameraId }
 
         // 2. Open (or extend) a motion-triggered clip recording for this camera
         //    — gated by the camera's Record toggle
-        val camera = cameraById[cameraId]
-        if (camera != null && features.record) {
-            clipRecorder.onMotion(camera, bitmap)
-        }
+        if (features.record) clipRecorder.onMotion(camera, bitmap)
 
         // Detect toggle off → no events or alerts (recording above is independent)
         if (!features.detect) return
 
-        // 3. Throttle event logging to once every 10 seconds per camera
-        val currentTime = System.currentTimeMillis()
-        val lastTime = lastEventTime[cameraId] ?: 0L
-        if (currentTime - lastTime >= 10000L) {
-            lastEventTime[cameraId] = currentTime
+        val zones = runtime.zonesFor(result.boxes, bitmap.width, bitmap.height)
+        val severity = runtime.review.classify(ReviewRules.MOTION_LABEL, zones) ?: return
 
-            // Save a snapshot for the event thumbnail — gated by the Snapshots toggle
-            val snapshotPath = if (features.snapshots)
-                clipRecorder.saveEventSnapshot(cameraId, "motion", bitmap)
-            else null
+        // 3. One event per stretch of activity: extend the open one, or start a new one
+        val open = activeEvents[cameraId]
+        if (open != null) {
+            open.lastMotionAt = now
+            val mergedZones = open.zones + zones
+            val promoted = severity == ReviewSeverity.ALERT && open.severity != ReviewSeverity.ALERT
+            if (promoted || mergedZones != open.zones) {
+                open.zones = mergedZones
+                if (promoted) open.severity = ReviewSeverity.ALERT
+                nvrDao.updateEventReview(open.id, mergedZones.joinToString(",").ifEmpty { null }, open.severity.key)
+                if (promoted) raiseAlert(camera, mergedZones.toList(), bitmap)
+            }
+            return
+        }
 
-            // Insert event; videoPath is attached when the clip finalizes (see reap loop)
-            val eventId = nvrDao.insertEvent(
-                com.zektopic.frigate.data.EventEntity(
-                    cameraId = cameraId,
-                    label = "motion",
-                    confidence = 1.0f,
-                    timestamp = currentTime,
-                    snapshotPath = snapshotPath,
-                    videoPath = null,
-                    zone = "Main Zone"
-                )
+        // Save a snapshot for the event thumbnail — gated by the Snapshots toggle
+        val snapshotPath = if (features.snapshots)
+            clipRecorder.saveEventSnapshot(cameraId, ReviewRules.MOTION_LABEL, bitmap)
+        else null
+
+        // The clip is attached when the recording finalizes (see reapFinishedActivity)
+        val eventId = nvrDao.insertEvent(
+            EventEntity(
+                cameraId = cameraId,
+                label = ReviewRules.MOTION_LABEL,
+                confidence = 1.0f,
+                timestamp = now,
+                snapshotPath = snapshotPath,
+                videoPath = null,
+                zone = zones.joinToString(",").ifEmpty { null },
+                severity = severity.key
             )
-            activeEventIdByCamera[cameraId] = eventId
+        )
+        activeEvents[cameraId] = ActiveEvent(eventId, now, severity, zones.toSet())
+        if (severity == ReviewSeverity.ALERT) raiseAlert(camera, zones, bitmap)
+    }
 
-            // Trigger system alerts for motion detection
-            triggerSystemAlert(cameraId, "motion", 1.0f)
+    private fun raiseAlert(camera: CameraConfigEntity, zones: List<String>, frame: Bitmap) {
+        _activeAlerts.update { it + camera.id }
+        // Respect the user's notification preferences (global + per-camera mute)
+        if (!notificationSettings.shouldNotify(camera.id)) return
+        alertManager.postMotionAlert(camera.id, camera.name, zones, frame)
+    }
+
+    /** Finalize idle recordings, close the events they belong to, and expire motion state. */
+    private suspend fun reapFinishedActivity() {
+        val now = System.currentTimeMillis()
+        try {
+            for ((cameraId, path) in clipRecorder.reapIdleSessions()) {
+                closeEvent(cameraId, path, now)
+            }
+            // Events with no recording behind them (Record off, or the encoder cap was
+            // hit) have nothing to finalize, so they end when the motion does.
+            for ((cameraId, event) in activeEvents) {
+                if (!clipRecorder.isRecording(cameraId) && now - event.lastMotionAt > EVENT_IDLE_MS) {
+                    closeEvent(cameraId, null, event.lastMotionAt)
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to finalize recordings", e)
+        }
+
+        val still = _activeMotion.value.filterTo(HashSet()) { now - (lastMotionAt[it] ?: 0L) <= MOTION_HOLD_MS }
+        if (still != _activeMotion.value) _activeMotion.value = still
+        for (id in latestMotionBoxes.keys) {
+            if (id !in still) latestMotionBoxes[id] = emptyList()
         }
     }
 
-    private fun triggerSystemAlert(cameraId: String, label: String, confidence: Float) {
-        // Respect the user's notification preferences (global + per-camera mute)
-        if (!notificationSettings.shouldNotify(cameraId)) return
-
-        val notificationManager = androidx.core.app.NotificationManagerCompat.from(this)
-
-        // Validate runtime permissions
-        if (android.os.Build.VERSION.SDK_INT >= 33) {
-            val permissionState = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-            if (permissionState != android.content.pm.PackageManager.PERMISSION_GRANTED) return
-        }
-
-        val text = "Motion was detected on camera '$cameraId'."
-        val builder = androidx.core.app.NotificationCompat.Builder(this, FrigateApp.CHANNEL_ALERTS)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setContentTitle("Frigate Alert: Motion Detected")
-            .setContentText(text)
-            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-
+    private suspend fun closeEvent(cameraId: String, videoPath: String?, endTime: Long) {
+        val event = activeEvents.remove(cameraId) ?: return
+        _activeAlerts.update { it - cameraId }
         try {
-            notificationManager.notify(label.hashCode() + cameraId.hashCode(), builder.build())
-        } catch (e: SecurityException) {
-            Log.e(tag, "Notification security exception", e)
+            nvrDao.finishEvent(event.id, videoPath, endTime)
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to close event ${event.id}", e)
+        }
+    }
+
+    private suspend fun closeAllEvents(savedClips: List<Pair<String, String>>) {
+        val now = System.currentTimeMillis()
+        val clipByCamera = savedClips.toMap()
+        for (cameraId in activeEvents.keys.toList()) {
+            closeEvent(cameraId, clipByCamera[cameraId], now)
+        }
+    }
+
+    private suspend fun sampleStats() {
+        val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
+        val memInfo = android.app.ActivityManager.MemoryInfo()
+        val runtime = Runtime.getRuntime()
+        while (serviceScope.isActive) {
+            if (!_running.value) {
+                delay(StatsCollector.SAMPLE_INTERVAL_MS)
+                continue
+            }
+            am.getMemoryInfo(memInfo)
+            val memoryPercent = if (memInfo.totalMem > 0)
+                100f * (memInfo.totalMem - memInfo.availMem) / memInfo.totalMem else 0f
+            val sample = statsCollector.sample(
+                nowMs = System.currentTimeMillis(),
+                cameraIds = cameraById.keys.toList(),
+                frames = { StreamDiagnostics.byCamera[it]?.frames?.get() ?: 0L },
+                cpuTimeMs = android.os.Process.getElapsedCpuTime(),
+                memoryPercent = memoryPercent,
+                heapMb = (runtime.totalMemory() - runtime.freeMemory()) / 1_048_576f
+            )
+            if (sample != null) {
+                _stats.update { (it + sample).takeLast(StatsCollector.HISTORY) }
+            }
+            delay(StatsCollector.SAMPLE_INTERVAL_MS)
         }
     }
 
@@ -495,5 +721,16 @@ class NvrService : Service(), LifecycleOwner {
 
     inner class NvrBinder : Binder() {
         fun getService(): NvrService = this@NvrService
+    }
+
+    private companion object {
+        val DEFAULT_RUNTIME = CameraRuntimeConfig()
+        const val MIN_DETECT_INTERVAL_MS = 200L
+        const val REAP_INTERVAL_MS = 2_000L
+        /** How long after the last motion an event without a recording stays open. */
+        const val EVENT_IDLE_MS = 6_000L
+        /** How long a tile keeps its motion indicator after the last moving frame. */
+        const val MOTION_HOLD_MS = 3_000L
+        const val STALE_EVENT_MS = 120_000L
     }
 }

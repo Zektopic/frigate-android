@@ -42,6 +42,23 @@ interface NvrDao {
     @Query("SELECT * FROM nvr_events ORDER BY timestamp DESC")
     fun getAllEventsFlow(): Flow<List<EventEntity>>
 
+    /**
+     * What the UI observes. Bounded: an NVR left running accumulates tens of
+     * thousands of rows, and the unbounded flow re-read and re-diffed every one of
+     * them each time a single event was inserted.
+     */
+    @Query("SELECT * FROM nvr_events ORDER BY timestamp DESC LIMIT :limit")
+    fun getRecentEventsFlow(limit: Int): Flow<List<EventEntity>>
+
+    @Query("SELECT * FROM nvr_events WHERE id = :id")
+    suspend fun getEventById(id: Long): EventEntity?
+
+    @Query("UPDATE nvr_events SET hasBeenReviewed = :reviewed WHERE id IN (:ids)")
+    suspend fun setEventsReviewed(ids: List<Long>, reviewed: Boolean)
+
+    @Query("DELETE FROM nvr_events WHERE id IN (:ids)")
+    suspend fun deleteEvents(ids: List<Long>)
+
     @Query("SELECT * FROM nvr_events ORDER BY timestamp DESC LIMIT :limit OFFSET :offset")
     suspend fun getPagedEvents(limit: Int, offset: Int): List<EventEntity>
 
@@ -56,6 +73,22 @@ interface NvrDao {
 
     @Query("UPDATE nvr_events SET videoPath = :videoPath WHERE id = :eventId")
     suspend fun updateEventVideoPath(eventId: Long, videoPath: String)
+
+    /** An event in progress moved into a zone, or was promoted from detection to alert. */
+    @Query("UPDATE nvr_events SET zone = :zone, severity = :severity WHERE id = :eventId")
+    suspend fun updateEventReview(eventId: Long, zone: String?, severity: String)
+
+    /** Close out an event once its recording has been finalized. */
+    @Query("UPDATE nvr_events SET videoPath = :videoPath, endTime = :endTime WHERE id = :eventId")
+    suspend fun finishEvent(eventId: Long, videoPath: String?, endTime: Long)
+
+    /**
+     * Events left open by a process that died mid-recording. Their clip never
+     * finalized, so nothing will ever close them; without this they show a spinner
+     * on the Review page forever.
+     */
+    @Query("UPDATE nvr_events SET endTime = timestamp WHERE endTime IS NULL AND timestamp < :before")
+    suspend fun closeStaleEvents(before: Long)
 
     /**
      * Detach events from files the janitor has deleted.

@@ -3,283 +3,62 @@ package com.zektopic.frigate.ui.settings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.NetworkCheck
+import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.zektopic.frigate.data.CameraConfigEntity
-import com.zektopic.frigate.ui.theme.*
-import kotlinx.coroutines.Dispatchers
+import com.zektopic.frigate.ui.components.ActivityIndicator
+import com.zektopic.frigate.ui.components.ButtonVariant
+import com.zektopic.frigate.ui.components.FrigateButton
+import com.zektopic.frigate.ui.components.FrigateSlider
+import com.zektopic.frigate.ui.components.FrigateSwitch
+import com.zektopic.frigate.ui.components.RoundedLg
+import com.zektopic.frigate.ui.components.RoundedMd
+import com.zektopic.frigate.ui.components.SettingRow
+import com.zektopic.frigate.ui.components.frigateTextFieldColors
+import com.zektopic.frigate.ui.theme.FrigateTheme
+import com.zektopic.frigate.ui.theme.FrigateType
+import com.zektopic.frigate.util.CredentialRedactor
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.yaml.snakeyaml.DumperOptions
-import org.yaml.snakeyaml.Yaml
 
-// ---------------------------------------------------------------------------
-// YAML config editing
-// ---------------------------------------------------------------------------
+private val wizardSteps = listOf("Camera", "Detection & recording", "Test & save")
 
-/** Form state collected by the wizard; maps 1:1 onto a Frigate camera block. */
-data class CameraDraft(
-    val originalId: String? = null, // set when editing an existing camera
-    val name: String = "",
-    val rtspUrl: String = "",
-    val detectWidth: Int = 640,
-    val detectHeight: Int = 360,
-    val fps: Int = 5,
-    val motionThresholdPercent: Int = 2,
-    val retentionDays: Float = 3.0f,
-    val enabled: Boolean = true
-) {
-    val cameraId: String
-        get() = originalId ?: name.trim().lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_')
-}
-
-object CameraYamlEditor {
-
-    private fun yaml(): Yaml {
-        val options = DumperOptions().apply {
-            defaultFlowStyle = DumperOptions.FlowStyle.BLOCK
-            indent = 2
-            isPrettyFlow = true
-        }
-        return Yaml(options)
-    }
-
-    @Suppress("UNCHECKED_CAST")
-    private fun loadRoot(yamlText: String): MutableMap<String, Any> {
-        val loaded = Yaml().load<Any>(yamlText.ifBlank { "{}" })
-        return (loaded as? MutableMap<String, Any>) ?: linkedMapOf()
-    }
-
-    /** Insert or replace `cameras.<id>` in the stored config YAML. */
-    @Suppress("UNCHECKED_CAST")
-    fun upsertCamera(yamlText: String, draft: CameraDraft): String {
-        val root = loadRoot(yamlText)
-        val cameras = (root["cameras"] as? MutableMap<String, Any>) ?: linkedMapOf()
-
-        cameras[draft.cameraId] = linkedMapOf<String, Any>(
-            "enabled" to draft.enabled,
-            "ffmpeg" to linkedMapOf(
-                "inputs" to listOf(
-                    linkedMapOf(
-                        "path" to draft.rtspUrl.trim(),
-                        "roles" to listOf("detect", "record")
-                    )
-                )
-            ),
-            "detect" to linkedMapOf(
-                "width" to draft.detectWidth,
-                "height" to draft.detectHeight,
-                "fps" to draft.fps
-            ),
-            "motion" to linkedMapOf(
-                "threshold" to draft.motionThresholdPercent
-            ),
-            "record" to linkedMapOf(
-                "enabled" to true,
-                "retain" to linkedMapOf("days" to draft.retentionDays)
-            )
-        )
-        root["cameras"] = cameras
-        return yaml().dump(root)
-    }
-
-    /** Remove `cameras.<id>` from the stored config YAML. */
-    @Suppress("UNCHECKED_CAST")
-    fun removeCamera(yamlText: String, cameraId: String): String {
-        val root = loadRoot(yamlText)
-        val cameras = (root["cameras"] as? MutableMap<String, Any>) ?: return yamlText
-        cameras.remove(cameraId)
-        root["cameras"] = cameras
-        return yaml().dump(root)
-    }
-
-    /** Per-camera feature flag toggled from the live tiles. */
-    enum class Feature(val block: String) { DETECT("detect"), RECORD("record"), SNAPSHOTS("snapshots") }
-
-    private fun asBool(value: Any?, default: Boolean): Boolean = when (value) {
-        is Boolean -> value
-        is String -> value.equals("true", ignoreCase = true)
-        else -> default
-    }
-
-    /**
-     * Read the detect/record/snapshots enabled flags for every camera in the
-     * config. Absent flags default to true (the app's historical behavior), so
-     * existing configs keep recording and snapshots on.
-     */
-    @Suppress("UNCHECKED_CAST")
-    fun readAllCameraFeatures(yamlText: String): Map<String, CameraFeatures> {
-        val root = try { loadRoot(yamlText) } catch (e: Exception) { return emptyMap() }
-        val cameras = root["cameras"] as? Map<String, Any> ?: return emptyMap()
-        val result = LinkedHashMap<String, CameraFeatures>()
-        for ((id, raw) in cameras) {
-            val cam = raw as? Map<String, Any> ?: continue
-            fun blockEnabled(name: String): Boolean {
-                val block = cam[name] as? Map<String, Any> ?: return true
-                return asBool(block["enabled"], true)
-            }
-            result[id] = CameraFeatures(
-                detect = blockEnabled("detect"),
-                record = blockEnabled("record"),
-                snapshots = blockEnabled("snapshots")
-            )
-        }
-        return result
-    }
-
-    /** Set `cameras.<id>.<block>.enabled` and return the updated YAML. */
-    @Suppress("UNCHECKED_CAST")
-    fun setCameraFeature(yamlText: String, cameraId: String, feature: Feature, enabled: Boolean): String {
-        val root = loadRoot(yamlText)
-        val cameras = (root["cameras"] as? MutableMap<String, Any>) ?: return yamlText
-        val cam = (cameras[cameraId] as? MutableMap<String, Any>) ?: return yamlText
-        val block = (cam[feature.block] as? MutableMap<String, Any>) ?: linkedMapOf()
-        block["enabled"] = enabled
-        cam[feature.block] = block
-        cameras[cameraId] = cam
-        root["cameras"] = cameras
-        return yaml().dump(root)
-    }
-
-    /** Read the top-level MQTT / detection / tracked-object globals. */
-    @Suppress("UNCHECKED_CAST")
-    fun readGlobals(yamlText: String): GlobalConfigDraft {
-        val root = try { loadRoot(yamlText) } catch (e: Exception) { return GlobalConfigDraft() }
-        val mqtt = root["mqtt"] as? Map<String, Any>
-        val detect = root["detect"] as? Map<String, Any>
-        val objects = root["objects"] as? Map<String, Any>
-        val track = (objects?.get("track") as? List<*>)?.mapNotNull { it?.toString() } ?: emptyList()
-        val default = GlobalConfigDraft()
-        return GlobalConfigDraft(
-            mqttHost = (mqtt?.get("host") as? String) ?: "",
-            mqttPort = (mqtt?.get("port") as? Number)?.toInt() ?: default.mqttPort,
-            detectWidth = (detect?.get("width") as? Number)?.toInt() ?: default.detectWidth,
-            detectHeight = (detect?.get("height") as? Number)?.toInt() ?: default.detectHeight,
-            detectFps = (detect?.get("fps") as? Number)?.toInt() ?: default.detectFps,
-            trackedObjects = track.ifEmpty { default.trackedObjects }
-        )
-    }
-
-    /** Insert or replace the top-level `mqtt`, `detect`, and `objects.track` blocks. */
-    @Suppress("UNCHECKED_CAST")
-    fun upsertGlobals(yamlText: String, draft: GlobalConfigDraft): String {
-        val root = loadRoot(yamlText)
-        if (draft.mqttHost.isNotBlank()) {
-            root["mqtt"] = linkedMapOf<String, Any>("host" to draft.mqttHost.trim(), "port" to draft.mqttPort)
-        } else {
-            root.remove("mqtt")
-        }
-        root["detect"] = linkedMapOf<String, Any>(
-            "width" to draft.detectWidth,
-            "height" to draft.detectHeight,
-            "fps" to draft.detectFps
-        )
-        root["objects"] = linkedMapOf<String, Any>("track" to draft.trackedObjects)
-        return yaml().dump(root)
-    }
-}
-
-/** Snapshot of a camera's live feature toggles, consumed by the NVR service. */
-data class CameraFeatures(
-    val detect: Boolean = true,
-    val record: Boolean = true,
-    val snapshots: Boolean = true
-)
-
-/** Top-level (non per-camera) configuration edited in the global settings form. */
-data class GlobalConfigDraft(
-    val mqttHost: String = "",
-    val mqttPort: Int = 1883,
-    val detectWidth: Int = 640,
-    val detectHeight: Int = 360,
-    val detectFps: Int = 5,
-    val trackedObjects: List<String> = listOf("person", "car", "bird")
-)
-
-// ---------------------------------------------------------------------------
-// RTSP connection test
-// ---------------------------------------------------------------------------
-
-data class RtspTestResult(val reachable: Boolean, val message: String)
-
-/**
- * Minimal RTSP probe: TCP connect + DESCRIBE, report reachability and the
- * advertised video codec. Credentials are left to the player (a 401 still
- * proves the camera is alive).
- */
-suspend fun testRtspConnection(url: String): RtspTestResult = withContext(Dispatchers.IO) {
-    try {
-        val uri = java.net.URI(url.trim())
-        if (!uri.scheme.equals("rtsp", ignoreCase = true) || uri.host.isNullOrEmpty()) {
-            return@withContext RtspTestResult(false, "Not a valid rtsp:// URL")
-        }
-        val port = if (uri.port > 0) uri.port else 554
-        java.net.Socket().use { socket ->
-            socket.connect(java.net.InetSocketAddress(uri.host, port), 5000)
-            socket.soTimeout = 5000
-            val requestUrl = buildString {
-                append("rtsp://").append(uri.host)
-                if (uri.port > 0) append(":").append(uri.port)
-                append(uri.rawPath ?: "")
-                if (!uri.rawQuery.isNullOrEmpty()) append("?").append(uri.rawQuery)
-            }
-            socket.getOutputStream().apply {
-                write("DESCRIBE $requestUrl RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\nUser-Agent: FrigateAndroid\r\n\r\n".toByteArray())
-                flush()
-            }
-
-            val input = socket.getInputStream()
-            val response = StringBuilder()
-            val buf = ByteArray(8192)
-            val deadline = System.currentTimeMillis() + 5000
-            while (System.currentTimeMillis() < deadline && response.length < 32_768) {
-                val n = try { input.read(buf) } catch (e: java.net.SocketTimeoutException) { break }
-                if (n <= 0) break
-                response.append(String(buf, 0, n, Charsets.ISO_8859_1))
-                if (response.contains("\r\n\r\n") && response.contains("a=rtpmap")) break
-                if (response.contains("\r\n\r\n") && !response.startsWith("RTSP/1.0 200")) break
-            }
-
-            val text = response.toString()
-            val statusLine = text.lineSequence().firstOrNull() ?: ""
-            return@withContext when {
-                statusLine.contains(" 200") -> {
-                    val codecs = Regex("a=rtpmap:\\d+ ([A-Za-z0-9-]+)/")
-                        .findAll(text).map { it.groupValues[1] }.distinct().joinToString(", ")
-                    RtspTestResult(true, if (codecs.isNotEmpty()) "Camera reachable — codec: $codecs" else "Camera reachable")
-                }
-                statusLine.contains(" 401") ->
-                    RtspTestResult(true, "Camera reachable — requires authentication (credentials in the URL will be used)")
-                statusLine.isNotEmpty() ->
-                    RtspTestResult(false, "Camera answered: ${statusLine.trim()}")
-                else ->
-                    RtspTestResult(false, "Connected, but no RTSP response (is this an RTSP server?)")
-            }
-        }
-    } catch (e: Exception) {
-        RtspTestResult(false, "Connection failed: ${e.message ?: e.javaClass.simpleName}")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wizard UI
-// ---------------------------------------------------------------------------
-
-@OptIn(ExperimentalMaterial3Api::class)
+/** Add or edit a camera in three steps, ending with a live connection test. */
 @Composable
 fun CameraWizardDialog(
     existingCamera: CameraConfigEntity?,
@@ -287,6 +66,7 @@ fun CameraWizardDialog(
     onSave: suspend (String) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val colors = FrigateTheme.colors
     val scope = rememberCoroutineScope()
     var step by remember { mutableIntStateOf(0) }
     var draft by remember {
@@ -295,10 +75,10 @@ fun CameraWizardDialog(
                 originalId = existingCamera.id,
                 name = existingCamera.name,
                 rtspUrl = existingCamera.rtspUrl,
+                detectUrl = existingCamera.detectRtspUrl,
                 detectWidth = existingCamera.detectWidth,
                 detectHeight = existingCamera.detectHeight,
                 fps = existingCamera.fps,
-                motionThresholdPercent = (existingCamera.motionThreshold * 100).toInt().coerceIn(1, 50),
                 retentionDays = existingCamera.recordingRetentionDays,
                 enabled = existingCamera.isEnabled
             ) else CameraDraft()
@@ -309,151 +89,105 @@ fun CameraWizardDialog(
     var saving by remember { mutableStateOf(false) }
     var saveError by remember { mutableStateOf<String?>(null) }
 
-    val stepTitles = listOf("Camera", "Detection & recording", "Test & save")
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
-    ) {
-        Card(
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(
             modifier = Modifier
-                .fillMaxWidth(0.94f)
-                .border(1.dp, SlateBorder, RoundedCornerShape(12.dp)),
-            shape = RoundedCornerShape(12.dp),
-            colors = CardDefaults.cardColors(containerColor = SlateCard)
+                .padding(16.dp)
+                .widthIn(max = 560.dp)
+                .fillMaxWidth()
+                .clip(RoundedLg)
+                .background(colors.background)
+                .border(1.dp, colors.input, RoundedLg)
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Column(
-                modifier = Modifier
-                    .padding(20.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                // Header
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = if (existingCamera == null) "Add camera" else "Edit camera",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = TextPrimary,
-                        modifier = Modifier.weight(1f)
-                    )
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, contentDescription = "Close", tint = TextMuted)
-                    }
-                }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (existingCamera == null) "Add Camera" else "Edit Camera",
+                    style = FrigateType.lg.copy(fontWeight = FontWeight.SemiBold),
+                    color = colors.primary,
+                    modifier = Modifier.weight(1f)
+                )
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = "Close",
+                    tint = colors.mutedForeground,
+                    modifier = Modifier.clip(RoundedMd).clickable(onClick = onDismiss).padding(4.dp).size(20.dp)
+                )
+            }
 
-                // Step indicator
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    stepTitles.forEachIndexed { index, title ->
-                        val active = index == step
-                        val done = index < step
-                        Box(
-                            modifier = Modifier
-                                .size(20.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (active || done) FrigateBlue else SlateBorder),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (done) {
-                                Icon(Icons.Default.Check, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(12.dp))
-                            } else {
-                                Text("${index + 1}", color = TextPrimary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                        Text(
-                            text = title,
-                            fontSize = 11.sp,
-                            color = if (active) TextPrimary else TextMuted,
-                            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal
-                        )
-                        if (index < stepTitles.lastIndex) {
-                            Box(
-                                modifier = Modifier
-                                    .width(14.dp)
-                                    .height(1.dp)
-                                    .background(SlateBorder)
+            // Step indicator
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                wizardSteps.forEachIndexed { index, title ->
+                    val active = index == step
+                    val done = index < step
+                    Box(
+                        modifier = Modifier
+                            .size(22.dp)
+                            .clip(CircleShape)
+                            .background(if (active || done) colors.selected else colors.secondary),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (done) {
+                            Icon(Icons.Filled.Check, contentDescription = null, tint = Color.White, modifier = Modifier.size(12.dp))
+                        } else {
+                            Text(
+                                "${index + 1}",
+                                style = FrigateType.xs.copy(fontWeight = FontWeight.SemiBold),
+                                color = if (active) Color.White else colors.mutedForeground
                             )
                         }
                     }
+                    if (active) Text(title, style = FrigateType.sm.copy(fontWeight = FontWeight.Medium), color = colors.primary)
+                    if (index < wizardSteps.lastIndex) Box(Modifier.width(16.dp).height(1.dp).background(colors.secondaryHighlight))
                 }
+            }
 
-                Divider(color = SlateBorder)
-
-                when (step) {
-                    0 -> WizardStepIdentity(draft, isEditing = existingCamera != null) { draft = it; testResult = null }
-                    1 -> WizardStepSettings(draft) { draft = it }
-                    2 -> WizardStepTest(
-                        draft = draft,
-                        testing = testing,
-                        testResult = testResult,
-                        onTest = {
-                            testing = true
-                            testResult = null
-                            scope.launch {
-                                testResult = testRtspConnection(draft.rtspUrl)
-                                testing = false
-                            }
-                        }
-                    )
-                }
-
-                saveError?.let {
-                    Text(it, color = ErrorRed, fontSize = 12.sp)
-                }
-
-                // Navigation buttons
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    if (step > 0) {
-                        OutlinedButton(
-                            onClick = { step-- },
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(6.dp),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextMuted)
-                        ) { Text("Back") }
+            when (step) {
+                0 -> WizardStepIdentity(draft, isEditing = existingCamera != null) { draft = it; testResult = null }
+                1 -> WizardStepSettings(draft) { draft = it }
+                else -> WizardStepTest(draft, testing, testResult) {
+                    testing = true
+                    testResult = null
+                    scope.launch {
+                        testResult = testRtspConnection(draft.detectUrl.ifBlank { draft.rtspUrl })
+                        testing = false
                     }
-                    if (step < 2) {
-                        val stepValid = when (step) {
-                            0 -> draft.name.isNotBlank() && draft.rtspUrl.trim().startsWith("rtsp://")
-                            else -> true
-                        }
-                        Button(
-                            onClick = { step++ },
-                            enabled = stepValid,
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(6.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = FrigateBlue, contentColor = TextPrimary)
-                        ) { Text("Next") }
-                    } else {
-                        Button(
-                            onClick = {
-                                saving = true
-                                saveError = null
-                                scope.launch {
-                                    try {
-                                        val newYaml = CameraYamlEditor.upsertCamera(currentYaml, draft)
-                                        onSave(newYaml)
-                                        onDismiss()
-                                    } catch (e: Exception) {
-                                        saveError = "Failed to save: ${e.message}"
-                                    } finally {
-                                        saving = false
-                                    }
+                }
+            }
+
+            saveError?.let { Text(it, style = FrigateType.sm, color = colors.danger) }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), modifier = Modifier.fillMaxWidth()) {
+                FrigateButton(onClick = { if (step > 0) step-- else onDismiss() }, small = false) {
+                    Text(if (step > 0) "Back" else "Cancel")
+                }
+                if (step < wizardSteps.lastIndex) {
+                    val valid = step != 0 || (draft.name.isNotBlank() && draft.cameraId.isNotEmpty() && draft.rtspUrl.trim().startsWith("rtsp://"))
+                    FrigateButton(onClick = { step++ }, enabled = valid, variant = ButtonVariant.Select, small = false) { Text("Next") }
+                } else {
+                    FrigateButton(
+                        onClick = {
+                            saving = true
+                            saveError = null
+                            scope.launch {
+                                try {
+                                    onSave(CameraYamlEditor.upsertCamera(currentYaml, draft))
+                                    onDismiss()
+                                } catch (e: Exception) {
+                                    saveError = "Failed to save: ${e.message}"
+                                } finally {
+                                    saving = false
                                 }
-                            },
-                            enabled = !saving,
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(6.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = FrigateBlue, contentColor = TextPrimary)
-                        ) {
-                            if (saving) {
-                                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = TextPrimary, strokeWidth = 2.dp)
-                            } else {
-                                Text(if (existingCamera == null) "Add camera" else "Save changes")
                             }
-                        }
+                        },
+                        enabled = !saving,
+                        variant = ButtonVariant.Select,
+                        small = false
+                    ) {
+                        if (saving) ActivityIndicator(size = 16.dp)
+                        Text(if (existingCamera == null) "Add Camera" else "Save")
                     }
                 }
             }
@@ -461,172 +195,144 @@ fun CameraWizardDialog(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FieldLabel(text: String) {
+    Text(text, style = FrigateType.sm.copy(fontWeight = FontWeight.Medium), color = FrigateTheme.colors.primary)
+}
+
+@Composable
+private fun FieldHelp(text: String) {
+    Text(text, style = FrigateType.xs, color = FrigateTheme.colors.mutedForeground)
+}
+
 @Composable
 private fun WizardStepIdentity(draft: CameraDraft, isEditing: Boolean, onChange: (CameraDraft) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        FieldLabel("Camera name")
         OutlinedTextField(
             value = draft.name,
             onValueChange = { onChange(draft.copy(name = it)) },
-            label = { Text("Camera name") },
-            supportingText = {
-                if (!isEditing && draft.name.isNotBlank()) {
-                    Text("ID: ${draft.cameraId}", color = TextMuted)
-                }
-            },
             singleLine = true,
+            textStyle = FrigateType.sm,
+            shape = RoundedMd,
             modifier = Modifier.fillMaxWidth(),
-            colors = wizardFieldColors()
+            colors = frigateTextFieldColors()
         )
+        if (!isEditing && draft.name.isNotBlank()) FieldHelp("ID: ${draft.cameraId}")
+
+        Spacer(Modifier.height(4.dp))
+        FieldLabel("Stream URL")
         OutlinedTextField(
             value = draft.rtspUrl,
             onValueChange = { onChange(draft.copy(rtspUrl = it)) },
-            label = { Text("RTSP URL") },
-            placeholder = { Text("rtsp://user:pass@192.168.1.10:554/stream", color = TextMuted) },
-            supportingText = { Text("Include credentials in the URL if the camera needs them", color = TextMuted) },
+            placeholder = { Text("rtsp://go2rtc-host:8554/camera", style = FrigateType.sm) },
             singleLine = true,
+            textStyle = FrigateType.sm,
+            shape = RoundedMd,
             modifier = Modifier.fillMaxWidth(),
-            colors = wizardFieldColors()
+            colors = frigateTextFieldColors()
         )
+        FieldHelp("Point this at your go2rtc restream rather than the camera: cameras allow only one or two RTSP sessions.")
+
+        Spacer(Modifier.height(4.dp))
+        FieldLabel("Detect substream URL (optional)")
+        OutlinedTextField(
+            value = draft.detectUrl,
+            onValueChange = { onChange(draft.copy(detectUrl = it)) },
+            placeholder = { Text("rtsp://go2rtc-host:8554/camera_sub", style = FrigateType.sm) },
+            singleLine = true,
+            textStyle = FrigateType.sm,
+            shape = RoundedMd,
+            modifier = Modifier.fillMaxWidth(),
+            colors = frigateTextFieldColors()
+        )
+        FieldHelp("A low-resolution stream to watch for motion. Decoding the full-resolution feed for detection is the largest single cost on a slow device.")
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun WizardStepSettings(draft: CameraDraft, onChange: (CameraDraft) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        Text("Detection resolution", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        FieldLabel("Detect resolution")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf(640 to 360, 1280 to 720).forEach { (w, h) ->
                 val selected = draft.detectWidth == w && draft.detectHeight == h
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(if (selected) FrigateBlue else SlateNav)
-                        .border(1.dp, if (selected) FrigateBlue else SlateBorder, RoundedCornerShape(6.dp))
-                        .clickable { onChange(draft.copy(detectWidth = w, detectHeight = h)) }
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
-                ) {
-                    Text("${w}×${h}", fontSize = 12.sp, color = if (selected) TextPrimary else TextMuted)
-                }
+                FrigateButton(
+                    onClick = { onChange(draft.copy(detectWidth = w, detectHeight = h)) },
+                    variant = if (selected) ButtonVariant.Select else ButtonVariant.Default
+                ) { Text("${w}x$h") }
             }
         }
 
-        Text("Detection FPS: ${draft.fps}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
-        Slider(
+        FieldLabel("Detect FPS: ${draft.fps}")
+        FrigateSlider(
             value = draft.fps.toFloat(),
             onValueChange = { onChange(draft.copy(fps = it.toInt().coerceIn(1, 15))) },
-            valueRange = 1f..15f,
-            steps = 13,
-            colors = SliderDefaults.colors(thumbColor = FrigateBlue, activeTrackColor = FrigateBlue)
+            valueRange = 1f..15f
         )
+        FieldHelp("5 is recommended. The device's own limit is applied on top of this.")
 
-        Text(
-            "Motion sensitivity: ${draft.motionThresholdPercent}% pixel change",
-            fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary
-        )
-        Slider(
-            value = draft.motionThresholdPercent.toFloat(),
-            onValueChange = { onChange(draft.copy(motionThresholdPercent = it.toInt().coerceIn(1, 50))) },
-            valueRange = 1f..50f,
-            colors = SliderDefaults.colors(thumbColor = FrigateBlue, activeTrackColor = FrigateBlue)
-        )
-        Text(
-            "Lower = more sensitive (more events). 2% is a good default.",
-            fontSize = 11.sp, color = TextMuted
-        )
-
-        Text("Recording retention: ${draft.retentionDays} days", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
-        Slider(
+        FieldLabel("Retain recordings: ${draft.retentionDays} days")
+        FrigateSlider(
             value = draft.retentionDays,
             onValueChange = { onChange(draft.copy(retentionDays = (it * 2).toInt() / 2f)) },
-            valueRange = 0.5f..14f,
-            colors = SliderDefaults.colors(thumbColor = FrigateBlue, activeTrackColor = FrigateBlue)
+            valueRange = 0.5f..14f
         )
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Camera enabled", fontSize = 12.sp, color = TextPrimary, modifier = Modifier.weight(1f))
-            Switch(
-                checked = draft.enabled,
-                onCheckedChange = { onChange(draft.copy(enabled = it)) },
-                colors = SwitchDefaults.colors(checkedTrackColor = FrigateBlue)
-            )
+        SettingRow("Enabled", description = "Connect to this camera") {
+            FrigateSwitch(draft.enabled, { onChange(draft.copy(enabled = it)) })
         }
     }
 }
 
 @Composable
-private fun WizardStepTest(
-    draft: CameraDraft,
-    testing: Boolean,
-    testResult: RtspTestResult?,
-    onTest: () -> Unit
-) {
+private fun WizardStepTest(draft: CameraDraft, testing: Boolean, testResult: RtspTestResult?, onTest: () -> Unit) {
+    val colors = FrigateTheme.colors
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Card(
-            colors = CardDefaults.cardColors(containerColor = SlateNav),
-            shape = RoundedCornerShape(8.dp),
-            modifier = Modifier.fillMaxWidth()
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedLg)
+                .background(colors.backgroundAlt)
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(draft.name, fontWeight = FontWeight.SemiBold, color = TextPrimary, fontSize = 13.sp)
-                Text(draft.rtspUrl, fontSize = 11.sp, color = TextMuted)
-                Text(
-                    "${draft.detectWidth}×${draft.detectHeight} @ ${draft.fps} FPS · motion ${draft.motionThresholdPercent}% · keep ${draft.retentionDays}d",
-                    fontSize = 11.sp, color = TextMuted
-                )
+            Text(draft.name, style = FrigateType.sm.copy(fontWeight = FontWeight.Medium), color = colors.primary)
+            // Shown masked: this dialog can be on screen while someone is looking over a shoulder.
+            Text(CredentialRedactor.redact(draft.rtspUrl), style = FrigateType.xs, color = colors.mutedForeground)
+            if (draft.detectUrl.isNotBlank()) {
+                Text("Detect: " + CredentialRedactor.redact(draft.detectUrl), style = FrigateType.xs, color = colors.mutedForeground)
             }
+            Text(
+                "${draft.detectWidth}x${draft.detectHeight} @ ${draft.fps} FPS ∙ keep ${draft.retentionDays}d",
+                style = FrigateType.xs,
+                color = colors.mutedForeground
+            )
         }
 
-        OutlinedButton(
-            onClick = onTest,
-            enabled = !testing,
-            shape = RoundedCornerShape(6.dp),
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = FrigateBlue)
-        ) {
+        FrigateButton(onClick = onTest, enabled = !testing, modifier = Modifier.fillMaxWidth(), small = false) {
             if (testing) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = FrigateBlue, strokeWidth = 2.dp)
-                Spacer(modifier = Modifier.width(8.dp))
+                ActivityIndicator(size = 16.dp)
                 Text("Testing…")
             } else {
-                Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(8.dp))
+                Icon(Icons.Filled.NetworkCheck, contentDescription = null, tint = colors.secondaryForeground, modifier = Modifier.size(18.dp))
                 Text("Test connection")
             }
         }
 
         testResult?.let { result ->
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Icon(
-                    imageVector = if (result.reachable) Icons.Default.CheckCircle else Icons.Default.Error,
+                    if (result.reachable) Icons.Filled.CheckCircle else Icons.Filled.Error,
                     contentDescription = null,
-                    tint = if (result.reachable) StatusGreen else StatusRed,
+                    tint = if (result.reachable) colors.success else colors.danger,
                     modifier = Modifier.size(18.dp)
                 )
-                Text(result.message, fontSize = 12.sp, color = if (result.reachable) StatusGreen else StatusRed)
+                Text(result.message, style = FrigateType.sm, color = if (result.reachable) colors.success else colors.danger)
             }
             if (!result.reachable) {
-                Text(
-                    "You can still save — the camera will show as offline until it becomes reachable.",
-                    fontSize = 11.sp, color = TextMuted
-                )
+                FieldHelp("You can still save. The camera shows as offline until it becomes reachable.")
             }
         }
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun wizardFieldColors() = OutlinedTextFieldDefaults.colors(
-    focusedBorderColor = FrigateBlue,
-    unfocusedBorderColor = SlateBorder,
-    cursorColor = FrigateBlue,
-    focusedTextColor = TextPrimary,
-    unfocusedTextColor = TextPrimary,
-    focusedLabelColor = FrigateBlue,
-    unfocusedLabelColor = TextMuted
-)
