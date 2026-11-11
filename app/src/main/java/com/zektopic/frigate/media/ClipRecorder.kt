@@ -49,12 +49,12 @@ class ClipRecorder(
      * decoders, so the right number on a Helio G88 is not the right number on a
      * flagship. Cameras beyond the cap skip recording for that event - logged and
      * counted in [capRefusals] rather than dropped silently.
+     *
+     * Read on every start rather than once, so `low_resource` takes effect without
+     * restarting the service.
      */
-    private val maxConcurrentEncoders: Int =
-        DevicePerformance.budget(context).maxConcurrentEncoders
-
-    /** Live encoder permits, bounding concurrent MediaCodec encoders across all cameras. */
-    private val encoderPermits = java.util.concurrent.Semaphore(maxConcurrentEncoders)
+    private val maxConcurrentEncoders: Int
+        get() = DevicePerformance.budget(context).maxConcurrentEncoders
 
     init {
         // Anything left in staging is from a process that died mid-encode: the muxer never
@@ -98,7 +98,8 @@ class ClipRecorder(
         val failedAt = lastStartFailureAt[camera.id]
         if (failedAt != null && now - failedAt < START_FAILURE_COOLDOWN_MS) return
 
-        if (!encoderPermits.tryAcquire()) {
+        // onMotion and detachSession share this monitor, so the session count is exact.
+        if (sessions.size >= maxConcurrentEncoders) {
             capRefusals.incrementAndGet()
             Log.w(tag, "Not recording ${camera.name}: already at $maxConcurrentEncoders concurrent encoders")
             return
@@ -109,7 +110,6 @@ class ClipRecorder(
         val h = if (firstFrame.height > 0) firstFrame.height else camera.detectHeight
         val encoder = VideoClipEncoder(w, h, camera.fps.coerceAtLeast(1), file)
         if (!encoder.start()) {
-            encoderPermits.release()
             lastStartFailureAt[camera.id] = now
             Log.e(tag, "Could not start clip encoder for ${camera.name}; backing off ${START_FAILURE_COOLDOWN_MS}ms")
             return
@@ -151,7 +151,7 @@ class ClipRecorder(
     private fun detachSession(cameraId: String, session: Session): File? {
         if (sessions.remove(cameraId) == null) return null
         activeSessions.decrementAndGet()
-        val ok = try { session.encoder.stop() } finally { encoderPermits.release() }
+        val ok = session.encoder.stop()
         return if (ok) {
             session.file
         } else {
@@ -179,6 +179,9 @@ class ClipRecorder(
         return finished
     }
 
+    /** True while [cameraId] has a clip being encoded. */
+    fun isRecording(cameraId: String): Boolean = sessions.containsKey(cameraId)
+
     /**
      * Stop and finalize all recordings (service shutdown, memory pressure).
      *
@@ -186,11 +189,18 @@ class ClipRecorder(
      * `onTrimMemory` at CRITICAL is the worst possible moment to copy megabytes to an
      * SD card. The clips are not lost — they land in the default location, which is
      * listed, played and swept exactly like the custom one.
+     *
+     * @return (cameraId, ref) for every clip saved, so the caller can attach each to
+     *   its event. They used to be dropped here, leaving the clip on disk with no
+     *   event pointing at it and the event with nothing to play.
      */
-    fun stopAll() {
+    fun stopAll(): List<Pair<String, String>> {
+        val saved = mutableListOf<Pair<String, String>>()
         for ((cameraId, session) in sessions.toMap()) {
-            detachSession(cameraId, session)?.let { store.stashLocally(it) }
+            val staged = detachSession(cameraId, session) ?: continue
+            store.stashLocally(staged)?.let { saved.add(cameraId to it) }
         }
+        return saved
     }
 
     /** Writes a JPEG for an event thumbnail; returns its ref (path or document URI). */

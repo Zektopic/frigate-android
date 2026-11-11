@@ -26,6 +26,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.zektopic.frigate.data.CameraConfigEntity
+import com.zektopic.frigate.util.CredentialRedactor
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -186,15 +187,23 @@ class StreamIngester(
             lastLiveUrl = lastLiveUrl,
             attemptedFallback = hasAttemptedFallback
         )
-        next.why?.let { Log.i(tag, "$it ($reason): ${next.url}") }
+        next.why?.let { Log.i(tag, "$it ($reason): ${CredentialRedactor.redact(next.url)}") }
         currentRtspUrl = next.url
         hasAttemptedFallback = next.attemptedFallback
         stopProducers()
         retryAttempt++
-        val delayMs = (2000L shl (retryAttempt - 1).coerceAtMost(5)).coerceAtMost(60_000L)
+        val backoffMs = (2000L shl (retryAttempt - 1).coerceAtMost(5)).coerceAtMost(60_000L)
+        // When several cameras fail together (Wi-Fi drop, go2rtc restart) they would
+        // otherwise all reconnect on the same tick and fight over the codec pool.
+        val plan = ReconnectCoordinator.shared.reportFailure(config.id, System.currentTimeMillis())
+        val delayMs = backoffMs + plan.staggerMs
         setState(if (retryAttempt >= 3) StreamState.OFFLINE else StreamState.RETRYING)
         StreamDiagnostics.recordReconnect(config.id, reason, retryAttempt)
-        Log.w(tag, "Stream down ($reason). Reconnect attempt #$retryAttempt in ${delayMs}ms")
+        Log.w(
+            tag,
+            "Stream down ($reason). Reconnect attempt #$retryAttempt in ${delayMs}ms" +
+                if (plan.shared) " (staggered: ${plan.peers.size} cameras failed together)" else ""
+        )
         val r = Runnable {
             if (isIngesting) {
                 setState(StreamState.CONNECTING)
@@ -208,6 +217,8 @@ class StreamIngester(
     private fun startLocalCameraIngestion() {
         if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             Log.e(tag, "Cannot start local camera ingestion: CAMERA permission not granted.")
+            StreamDiagnostics.setError(config.id, "", "CAMERA permission not granted")
+            setState(StreamState.OFFLINE)
             return
         }
         cameraExecutor = Executors.newSingleThreadExecutor()
@@ -224,6 +235,7 @@ class StreamIngester(
                     .build()
 
                 var lastProcessedTime = 0L
+                var reportedLive = false
                 val intervalMs = 1000L / effectiveFps
 
                 imageAnalysis.setAnalyzer(cameraExecutor!!, ImageAnalysis.Analyzer { imageProxy ->
@@ -241,6 +253,14 @@ class StreamIngester(
                                 config.detectHeight,
                                 true
                             )
+                            lastFrameTime = currentTime
+                            StreamDiagnostics.setLastFrameAt(config.id, currentTime, 0)
+                            // The device camera never reported LIVE, so its tile sat on
+                            // "Connecting" forever while frames were arriving.
+                            if (!reportedLive) {
+                                reportedLive = true
+                                mainHandler.post { if (isIngesting) setState(StreamState.LIVE) }
+                            }
                             onFrameExtracted(scaledBitmap)
                         }
                     }
@@ -264,12 +284,14 @@ class StreamIngester(
                 Log.d(tag, "Local CameraX ingestion initialized successfully.")
             } catch (e: Exception) {
                 Log.e(tag, "Failed to start local camera ingestion", e)
+                StreamDiagnostics.setError(config.id, "", "Device camera failed to start: ${e.message}")
+                setState(StreamState.OFFLINE)
             }
         }, ContextCompat.getMainExecutor(context))
     }
 
     private fun startRealRtspIngestion(myGeneration: Int) {
-        Log.d(tag, "Connecting to real RTSP stream: $currentRtspUrl (gen=$myGeneration)")
+        Log.d(tag, "Connecting to real RTSP stream: ${CredentialRedactor.redact(currentRtspUrl)} (gen=$myGeneration)")
         try {
             // Create a dedicated thread for frame extraction with its own EGL context
             frameExtractionExecutor = Executors.newSingleThreadExecutor()
@@ -586,6 +608,7 @@ class StreamIngester(
                                 if (isIngesting && generation.get() == myGeneration) {
                                     retryAttempt = 0
                                     lastLiveUrl = currentRtspUrl
+                                    ReconnectCoordinator.shared.reportRecovered(config.id)
                                     setState(StreamState.LIVE)
                                 }
                             }
@@ -1114,7 +1137,9 @@ object StreamDiagnostics {
         /** Current backoff attempt; 0 once a live frame has arrived. */
         @Volatile var retryAttempt: Int = 0,
         /** Wall-clock time of the last extracted frame, so /api/diag can show its age. */
-        @Volatile var lastFrameAt: Long = 0L
+        @Volatile var lastFrameAt: Long = 0L,
+        /** Frames extracted since the process started; sampled into a frame rate. */
+        val frames: java.util.concurrent.atomic.AtomicLong = java.util.concurrent.atomic.AtomicLong()
     )
     val byCamera = java.util.concurrent.ConcurrentHashMap<String, Entry>()
 
@@ -1131,6 +1156,7 @@ object StreamDiagnostics {
         val e = byCamera.getOrPut(cameraId) { Entry() }
         e.lastFrameAt = at
         e.retryAttempt = retryAttempt
+        e.frames.incrementAndGet()
     }
 
     fun setState(cameraId: String, url: String, state: String) {
@@ -1140,7 +1166,8 @@ object StreamDiagnostics {
 
     fun setError(cameraId: String, url: String, error: String) {
         val e = byCamera.getOrPut(cameraId) { Entry() }
-        e.lastError = error; e.url = url; e.updatedAt = System.currentTimeMillis()
+        // Player errors quote the URL they failed on, credentials included.
+        e.lastError = CredentialRedactor.redact(error); e.url = url; e.updatedAt = System.currentTimeMillis()
     }
 
     /** The decoder MediaCodec actually initialized — never a guess. */

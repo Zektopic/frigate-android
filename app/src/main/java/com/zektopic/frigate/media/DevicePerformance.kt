@@ -60,7 +60,29 @@ object DevicePerformance {
      * diagnostics report the budget without needing a Context; by the time anything
      * can call /api/diag the service has long since computed it.
      */
-    fun cachedBudget(): PerformanceBudget? = cached
+    fun cachedBudget(): PerformanceBudget? = cached?.let { effective(it) }
+
+    /**
+     * The config's `low_resource.enabled`, as last applied by NvrService. The fork's
+     * "potato PC" mode: an operator who knows the device is weaker than the probe
+     * believes (thermal throttling, a shared SoC, a slow SD card) can pin it to the
+     * cheapest tier instead of waiting for the low-memory killer to make the point.
+     */
+    @Volatile
+    var lowResource: Boolean = false
+
+    private fun effective(base: PerformanceBudget): PerformanceBudget =
+        if (lowResource) lowResourceBudget(base) else base
+
+    /** [base] pinned to the POTATO tier's numbers; never raises a limit. */
+    fun lowResourceBudget(base: PerformanceBudget): PerformanceBudget {
+        val potato = tierBudget(DeviceTier.POTATO, base.reportedDecoderInstances, base.totalRamMb, base.cores)
+        return potato.copy(
+            maxConcurrentStreams = minOf(potato.maxConcurrentStreams, base.maxConcurrentStreams),
+            maxConcurrentEncoders = minOf(potato.maxConcurrentEncoders, base.maxConcurrentEncoders),
+            detectFpsCap = minOf(potato.detectFpsCap, base.detectFpsCap)
+        )
+    }
 
     /**
      * The config's `android.max_concurrent_streams`, as last applied by NvrService,
@@ -81,13 +103,14 @@ object DevicePerformance {
     }
 
     /** Cached because probing MediaCodecList is not cheap and the answer cannot change. */
-    fun budget(context: Context): PerformanceBudget =
+    fun budget(context: Context): PerformanceBudget = effective(
         cached ?: synchronized(this) {
             cached ?: compute(context).also {
                 cached = it
                 Log.i(TAG, "Performance budget: ${it.describe()}")
             }
         }
+    )
 
     private fun compute(context: Context): PerformanceBudget {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -107,6 +130,11 @@ object DevicePerformance {
         // guarantee, so it is used as a ceiling, never as a target.
         val decoderInstances = maxDecoderInstances()
 
+        return tierBudget(tier, decoderInstances, totalRamMb, cores)
+    }
+
+    /** The caps for [tier] on a device advertising [decoderInstances] decoder instances. */
+    fun tierBudget(tier: DeviceTier, decoderInstances: Int, totalRamMb: Long, cores: Int): PerformanceBudget {
         val tierStreams = when (tier) {
             DeviceTier.POTATO -> 2
             DeviceTier.MODEST -> 4

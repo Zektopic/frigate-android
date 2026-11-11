@@ -355,44 +355,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun triggerTestAlertNotification() {
-        val notificationManager = NotificationManagerCompat.from(this)
-        
-        // Android 13+ requires post notification runtime permissions, handled gracefully
-        if (android.os.Build.VERSION.SDK_INT >= 33) {
-            val permissionState = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-            if (permissionState != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
-                return
-            }
+        // Android 13+ requires the notification permission at runtime
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
+            return
         }
-
-        val builder = NotificationCompat.Builder(this, FrigateApp.CHANNEL_ALERTS)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Frigate Alert: Person Detected")
-            .setContentText("A person entered the Front Driveway (Zone: Gate)")
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-
-        try {
-            notificationManager.notify(2, builder.build())
-            
-            // Log it in Room
-            lifecycleScope.launch(Dispatchers.IO) {
-                nvrDao.insertEvent(
-                    EventEntity(
-                        cameraId = "front_camera",
-                        label = "person",
-                        confidence = 0.96f,
-                        timestamp = System.currentTimeMillis(),
-                        snapshotPath = null,
-                        videoPath = null,
-                        zone = "Gate Zone"
-                    )
-                )
-            }
-        } catch (e: SecurityException) {
-            e.printStackTrace()
-        }
+        // Only the notification. This used to log a made-up "person, 96%" event as
+        // well, which then sat on the Review page as if it had happened.
+        com.zektopic.frigate.notification.AlertManager(this).postTestAlert()
     }
 
     @Suppress("DEPRECATION")
@@ -407,5 +379,10 @@ class MainActivity : ComponentActivity() {
             startNvrService()
             maybeAskToIgnoreBatteryOptimizations()
         }
+    }
+
+    companion object {
+        /** Set on the intent an alert notification opens, to land on the Review page. */
+        const val EXTRA_OPEN_REVIEW = "open_review"
     }
 }

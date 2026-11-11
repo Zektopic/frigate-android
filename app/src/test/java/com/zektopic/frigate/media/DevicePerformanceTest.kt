@@ -36,4 +36,31 @@ class DevicePerformanceTest {
         assertEquals(2, DevicePerformance.effectiveMaxStreams(tightPool, 5))
         assertEquals(1, DevicePerformance.effectiveMaxStreams(tablet.copy(reportedDecoderInstances = 1), 5))
     }
+
+    @Test
+    fun lowResourcePinsTheCheapestTier() {
+        val pinned = DevicePerformance.lowResourceBudget(tablet)
+        assertEquals(DeviceTier.POTATO, pinned.tier)
+        assertEquals(2, pinned.maxConcurrentStreams)
+        assertEquals(1, pinned.maxConcurrentEncoders)
+        assertEquals(3, pinned.detectFpsCap)
+        assertEquals(2_000L, pinned.streamStartStaggerMs)
+        // What the device is does not change, only what is asked of it
+        assertEquals(tablet.reportedDecoderInstances, pinned.reportedDecoderInstances)
+        assertEquals(tablet.totalRamMb, pinned.totalRamMb)
+    }
+
+    @Test
+    fun lowResourceNeverRaisesALimit() {
+        // A pool so small the device was already below the POTATO stream count
+        val tight = tablet.copy(maxConcurrentStreams = 1, reportedDecoderInstances = 2)
+        assertEquals(1, DevicePerformance.lowResourceBudget(tight).maxConcurrentStreams)
+    }
+
+    @Test
+    fun aTierNeverTakesTheLastCodecSlot() {
+        assertEquals(8, DevicePerformance.tierBudget(DeviceTier.CAPABLE, 32, 8_000, 8).maxConcurrentStreams)
+        assertEquals(3, DevicePerformance.tierBudget(DeviceTier.CAPABLE, 4, 8_000, 8).maxConcurrentStreams)
+        assertEquals(1, DevicePerformance.tierBudget(DeviceTier.CAPABLE, 1, 8_000, 8).maxConcurrentStreams)
+    }
 }
