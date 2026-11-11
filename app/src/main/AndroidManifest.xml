@@ -8,6 +8,10 @@
 
     <!-- Camera permissions for local feed option -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- The device camera is optional: without this, the CAMERA permission makes the store
+         treat a camera as required and hide the app from TV boxes and other camera-less
+         devices that make good NVR heads -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <!-- Storage permissions for saving NVR recordings and snapshots -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
