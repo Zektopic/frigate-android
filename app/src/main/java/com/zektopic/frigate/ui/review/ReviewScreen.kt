@@ -248,6 +248,8 @@ fun ReviewScreen(
                             items(items, key = { it.id }) { event ->
                                 ReviewThumbnail(
                                     event = event,
+                                    cameraName = state.cameras.firstOrNull { it.id == event.cameraId }?.name
+                                        ?: event.cameraId.replace('_', ' ').replaceFirstChar { it.uppercase() },
                                     now = now,
                                     dateText = format.format(Date(event.timestamp)),
                                     selected = event.id in selected,
@@ -423,6 +425,7 @@ private fun dayLabel(dayStart: Long): String {
 @Composable
 private fun ReviewThumbnail(
     event: EventEntity,
+    cameraName: String,
     now: Long,
     dateText: String,
     selected: Boolean,
@@ -461,7 +464,7 @@ private fun ReviewThumbnail(
             gradient = if (event.hasBeenReviewed) ChipGreen else ChipGray
         ) {
             Icon(Icons.Filled.Sensors, contentDescription = event.label, modifier = Modifier.size(12.dp))
-            Text(event.cameraId.replace('_', ' ').replaceFirstChar { it.uppercase() })
+            Text(cameraName)
             for (zone in event.zones) Text("∙ ${zone.replace('_', ' ')}")
         }
 

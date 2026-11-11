@@ -95,10 +95,11 @@ fun FrigateAppShell(
     state: NvrUiState,
     frames: Map<String, Bitmap>,
     actions: NvrActions,
-    openReviewRequest: Int = 0
+    openReviewRequest: Int = 0,
+    startPage: Page = Page.LIVE
 ) {
     val colors = FrigateTheme.colors
-    var page by rememberSaveable { mutableStateOf(Page.LIVE) }
+    var page by rememberSaveable { mutableStateOf(startPage) }
     var liveGroup by rememberSaveable { mutableStateOf(LiveGroups.ALL) }
     var liveCameraId by rememberSaveable { mutableStateOf<String?>(null) }
     var reviewEventId by rememberSaveable { mutableStateOf<Long?>(null) }

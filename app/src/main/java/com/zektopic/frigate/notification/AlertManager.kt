@@ -53,10 +53,14 @@ class AlertManager(private val context: Context) {
             .setCategory(NotificationCompat.CATEGORY_ALARM)
 
         if (snapshot != null && !snapshot.isRecycled) {
-            builder.setLargeIcon(snapshot)
+            // Scaled copies, never the frame itself: a notification's bitmaps travel
+            // through Binder, and a full detect frame attached twice (~1.8 MB at
+            // 640x360) is enough to fail the post with TransactionTooLargeException.
+            val picture = scaledCopy(snapshot, BIG_PICTURE_WIDTH)
+            builder.setLargeIcon(scaledCopy(snapshot, LARGE_ICON_WIDTH))
             builder.setStyle(
                 NotificationCompat.BigPictureStyle()
-                    .bigPicture(snapshot)
+                    .bigPicture(picture)
                     .bigLargeIcon(null as Bitmap?)
                     .setBigContentTitle(title)
                     .setSummaryText(text)
@@ -70,6 +74,12 @@ class AlertManager(private val context: Context) {
         }
     }
 
+    private fun scaledCopy(source: Bitmap, maxWidth: Int): Bitmap {
+        if (source.width <= maxWidth) return source.copy(Bitmap.Config.ARGB_8888, false)
+        val height = (source.height.toLong() * maxWidth / source.width).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(source, maxWidth, height, true)
+    }
+
     /** A sample alert, so the user can check that notifications reach them. */
     fun postTestAlert() {
         postMotionAlert(TEST_CAMERA_ID, "Test alert", emptyList(), null)
@@ -79,5 +89,7 @@ class AlertManager(private val context: Context) {
         // Keeps alert ids clear of the foreground service's notification (id 1).
         const val NOTIFICATION_ID_BASE = 1000
         const val TEST_CAMERA_ID = "__test__"
+        const val BIG_PICTURE_WIDTH = 480
+        const val LARGE_ICON_WIDTH = 128
     }
 }

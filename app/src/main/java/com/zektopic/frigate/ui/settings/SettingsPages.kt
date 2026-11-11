@@ -415,6 +415,8 @@ private fun CameraPreview(
             .widthIn(max = 720.dp)
             .fillMaxWidth()
             .aspectRatio(camera.detectWidth.toFloat() / camera.detectHeight.coerceAtLeast(1))
+            // The overlays are siblings of the tile, so they need the tile's corners too
+            .clip(com.zektopic.frigate.ui.components.tileShape(wide))
     ) {
         LiveTile(
             camera = camera,

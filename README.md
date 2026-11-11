@@ -27,41 +27,95 @@ limits and frame rates are derived from the hardware at runtime rather than assu
 sheds load under memory pressure instead of waiting to be killed.
 
 > [!NOTE]
-> This is an NVR **viewer and recorder**, not a detection engine. Motion detection is
-> frame-differencing; object detection (person/car classification) runs on your Frigate server,
-> not here. See [Scope and limitations](#scope-and-limitations).
+> This is an NVR **viewer and recorder**, not a detection engine. Motion detection is Frigate's own
+> algorithm, ported; object detection (person/car classification) runs on your Frigate server, not
+> here. See [Scope and limitations](#scope-and-limitations).
+
+<p align="center">
+  <img src="docs/screenshots/wide-live.png" width="720" alt="Live dashboard on a tablet">
+</p>
 
 ---
 
 ## Features
 
+The interface follows the Frigate web UI page for page: its colour tokens (dark and light), its
+Inter typeface, its logo and its layout — a 52 dp sidebar with a status bar on a tablet or in
+landscape, a bottom bar on a phone.
+
+| Live | Review | System |
+|---|---|---|
+| ![Live](docs/screenshots/phone-live.png) | ![Review](docs/screenshots/phone-review.png) | ![System](docs/screenshots/phone-system.png) |
+
 ### Live
 
 | | |
 |---|---|
-| **Multi-camera wall** | Adaptive grid with 16:9 tiles — navigation rail on tablets and landscape, bottom bar on phones |
+| **Camera dashboard** | Rounded tiles with name chips, a pulsing dot on motion and a red outline while an alert is open; grid or list layout; recent unreviewed alerts in a strip above |
+| **Camera groups** | All Cameras, or Birdseye: only the cameras that see something right now |
+| **Camera view** | Back and History, Detect / Record / Snapshots toggles, pinch to zoom, stream stats, and a debug overlay drawing motion boxes, zones and masks |
 | **Real RTSP playback** | Media3/ExoPlayer with H.264 and H.265/HEVC, hardware decoding where available |
-| **Honest stream state** | `LIVE` / `CONNECTING` / `RETRYING` / `OFFLINE` with exponential-backoff reconnect — no placeholder or simulated feeds, ever |
-| **Fullscreen view** | Tap any tile for single-camera playback |
-| **Per-camera gating** | Detect / Record / Snapshots toggles that genuinely gate behaviour without restarting the stream |
+| **Honest stream state** | `LIVE` / `CONNECTING` / `RETRYING` / `OFFLINE`, never a placeholder feed. Cameras that fail together reconnect staggered rather than all at once |
 
 ### Review
 
-Motion events with snapshot thumbnails, relative timestamps and camera filter chips. Recorded MP4
-clips play in-app once finalized.
+Alerts, Detections and Motion, as in Frigate. Thumbnails show the camera and the zones the motion fell
+in, turn green once reviewed, and open a player for the clip. Filter by camera, by day and by
+reviewed state; long-press to select several and mark or delete them; a timeline down the side
+scrolls the grid to a time. Opening an item marks it reviewed.
 
 ### System
 
-Live device metrics — CPU, memory, storage — plus a per-camera status table showing the selected
-decoder, negotiated resolution and connection health.
+General (detection speed, CPU and memory graphs, hardware and performance budget), Storage (usage and
+a per-camera breakdown) and Cameras (status, resolution and decoder per camera, frame-rate and
+detection graphs). Every number is measured; nothing is a placeholder.
 
 ### Settings
 
-- **Camera wizard** — 3-step add/edit/delete with a live RTSP connection test (`DESCRIBE` probe reporting reachability and codec)
-- **Global configuration** — MQTT host/port, detection defaults, tracked objects
-- **Notifications** — master switch, alert-on-motion, per-camera mute, backed by DataStore and enforced by the service
-- **Storage** — recording count, on-disk size, free space, bulk delete, and a folder picker that sends recordings anywhere the device can write, SD cards and USB drives included
-- **Advanced** — raw YAML editor for the full Frigate-style config
+- **UI settings** — dark mode (system, light, dark), camera name chips, dashboard layout, 24-hour time
+- **Camera management** — add, edit, disable or remove cameras through a 3-step wizard with a live RTSP connection test and an optional detect substream
+- **Detect / Motion** — defaults for every camera
+- **Motion tuner** — threshold, contour area and contrast per camera, with the motion boxes drawn live
+- **Masks / Zones** — draw zones and motion masks on the camera picture
+- **Storage** — usage, a folder picker that sends recordings anywhere the device can write (SD cards and USB drives included), bulk delete
+- **Performance** — low-resource mode and the concurrent-stream cap
+- **Notifications** — master switch, alerts, per-camera mute
+- **Configuration editor** — the whole YAML, with Copy and Save
+
+## Motion, zones and review
+
+Motion detection is Frigate's `ImprovedMotionDetector`, with the pixel pipeline from the
+`frigate-motion-rs` crate in the [Frigate fork](https://github.com/Zektopic/frigate): contrast
+stretch, mask, blur, difference against a running-average background, threshold, dilate, and regions
+filtered by area. The `motion:` keys mean what they mean in Frigate:
+
+```yaml
+motion:
+  threshold: 30          # per-pixel luma change, 1-255
+  contour_area: 10       # smallest region that counts, in motion-frame pixels
+  improve_contrast: true
+  lightning_threshold: 0.8
+  mask:
+    - 0,0,0.35,0,0.35,0.08,0,0.08   # e.g. a timestamp overlay
+
+cameras:
+  front_door:
+    zones:
+      porch:
+        coordinates: 0.05,0.55,0.55,0.5,0.6,0.95,0.05,0.95
+
+review:
+  alerts:
+    required_zones: [porch]    # motion elsewhere is filed as a detection
+```
+
+Motion is attributed to a zone when the bottom-centre of its box falls inside, as Frigate does for
+objects. One review item spans one stretch of activity. Only alerts notify.
+
+> [!IMPORTANT]
+> Earlier versions read `motion.threshold` as a *percentage of pixels*, and the wizard wrote values
+> of 1–50. On first start, values of 50 or less are removed so the Frigate default applies; values
+> above 50 are kept.
 
 ---
 
@@ -111,7 +165,20 @@ before, so this is opt-in.
 `onTrimMemory` drops cached frames at `RUNNING_LOW` and additionally stops active recordings at
 `RUNNING_CRITICAL`. Streams stay up; the process survives rather than being killed by the
 low-memory killer. Stream startup is staggered so simultaneous `MediaCodec.configure()` calls
-don't turn "not enough codecs" into "no codecs at all".
+don't turn "not enough codecs" into "no codecs at all", and when several streams drop together
+(Wi-Fi, a go2rtc restart) their reconnects are staggered too.
+
+### Low-resource mode
+
+The fork's "potato PC" switch. It pins the budget to the `POTATO` tier whatever the hardware probe
+decided, for a device that throttles or is short of memory. Also under **Settings → Performance**.
+
+```yaml
+low_resource:
+  enabled: true
+android:
+  max_concurrent_streams: 3   # optional: override the measured stream cap
+```
 
 ---
 
@@ -182,9 +249,9 @@ flowchart LR
     WS --> API["HTTP API<br/>:8080"]
 ```
 
-**Config is YAML-first.** The Frigate-style YAML in Room is the single source of truth. The wizard,
-global form and live toggles all edit that YAML, and the service hot-reloads from it. Per-camera
-switches map to `cameras.<id>.{detect,record,snapshots}.enabled`.
+**Config is YAML-first.** The Frigate-style YAML in Room is the single source of truth. Every
+settings page edits that YAML, changing only the keys it is about, and the service hot-reloads from
+it. Per-camera switches map to `cameras.<id>.{detect,record,snapshots}.enabled`.
 
 **Frame pipeline.** `StreamIngester` drives an ExoPlayer RTSP session and extracts frames through an
 offscreen EGL pipeline, rendering the quad v-inverted so `glReadPixels` yields correct orientation
@@ -210,8 +277,17 @@ cd frigate-android
 ```
 
 On first launch the app seeds a default config **once**, gated on the real database so your edits
-are never overwritten on restart. Open **Settings → Cameras** to add your own, or edit the YAML
-under **Advanced**.
+are never overwritten on restart. Open **Settings → Camera management** to add your own, or edit the
+YAML in the **Configuration editor** (gear menu).
+
+### Screenshots
+
+`docs/screenshots/` is rendered on the JVM with Robolectric, so a UI change can be looked at
+without a device:
+
+```bash
+./gradlew testDebugUnitTest -Pscreenshots --tests '*ScreenshotTest*'
+```
 
 ### HTTP API
 
@@ -219,18 +295,23 @@ The embedded Ktor server listens on port `8080`.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/config` | Current YAML configuration |
-| `POST /api/config` | Replace configuration and restart streams |
+| `GET /` | A small read-only console in Frigate's colours |
+| `GET /api/config` | Current YAML configuration, credentials masked |
+| `POST /api/config` | Replace the configuration and restart streams |
 | `GET /api/status` | Service and camera summary |
-| `GET /api/events` | Recent motion events |
-| `GET /api/events/{id}/snapshot` | JPEG snapshot for an event |
+| `GET /api/stats` | CPU, memory and per-camera frame and detection rates |
+| `GET /api/events?limit=` | Recent review items with severity, zones and reviewed state |
+| `GET /api/events/{id}/snapshot` | JPEG snapshot for an item |
 | `GET /api/diag` | Device budget, per-camera diagnostics, encoder counters |
 | `GET /api/{camera}/live.mjpeg` | MJPEG stream at detect resolution |
 
+Stream credentials are masked (`rtsp://*:*@host`) everywhere they leave the app: the API, diagnostics
+and logs. A config fetched from `GET /api/config`, edited and sent back keeps its passwords:
+`POST` puts the stored credentials back behind every URL whose host and path did not change.
+
 > [!WARNING]
 > The server binds all interfaces and has **no authentication**. `POST /api/config` can replace your
-> entire camera configuration, and `GET /api/config` returns RTSP URLs including any embedded
-> credentials. Run it only on a trusted network.
+> entire camera configuration. Run it only on a trusted network.
 
 ---
 
@@ -250,21 +331,27 @@ The embedded Ktor server listens on port `8080`.
 ```
 app/src/main/java/com/zektopic/frigate/
 ├── MainActivity.kt                    # Compose host, service binding, first-run seeding
-├── service/NvrService.kt              # foreground service: streams, detection, recording, alerts
+├── service/
+│   ├── NvrService.kt                  # foreground service: streams, motion, events, recording, alerts
+│   └── SystemStats.kt                 # counters to per-interval rates for the System page
+├── ai/MotionDetector.kt               # Frigate's motion detector, ported
 ├── media/
 │   ├── StreamIngester.kt              # RTSP ingest, EGL frame extraction, sprop sniffing
-│   ├── DevicePerformance.kt           # hardware tiering and budget
+│   ├── ReconnectCoordinator.kt        # staggers reconnects when cameras fail together
+│   ├── DevicePerformance.kt           # hardware tiering, budget, low-resource mode
 │   ├── DecoderPolicy.kt               # vendor-aware decoder ranking
 │   ├── ClipRecorder.kt                # motion-triggered recording sessions
 │   └── VideoClipEncoder.kt            # MediaCodec AVC + EGL MP4 encoder
-├── data/RecordingStore.kt             # recording destination (default dir or SAF tree) + reads
-├── ui/
-│   ├── dashboard/DashboardScreen.kt   # Live · Review · System · Settings
-│   ├── settings/                      # camera wizard, YAML editor, settings sections
-│   └── zones/                         # zone drawing canvas
+├── data/                              # Room, YAML parsing, zones and review rules, storage
 ├── server/EmbeddedWebServer.kt        # Ktor HTTP API and web console
-├── ai/MotionDetector.kt               # frame-differencing motion detection
-└── data/                              # Room entities, DAO, YAML parser, preferences
+├── util/CredentialRedactor.kt         # masks credentials in URLs
+└── ui/
+    ├── AppShell.kt                    # sidebar, bottom bar, status bar, gear menu
+    ├── theme/                         # Frigate's colour tokens and Inter
+    ├── components/                    # buttons, chips, toggles, panels
+    ├── live/  review/  system/        # the pages
+    ├── settings/                      # settings pages, camera wizard, YAML editing
+    └── config/                        # configuration editor
 ```
 
 ---
@@ -273,11 +360,12 @@ app/src/main/java/com/zektopic/frigate/
 
 Being explicit about what this does **not** do:
 
-- **No object detection.** `MotionDetector` is grayscale frame-differencing. Events are labelled
-  `motion`; person/car classification happens on your Frigate server.
-- **No continuous recording.** Motion-triggered clips only, capped at 60 s each.
-- **MQTT and tracked-object settings persist but are not yet consumed.**
-- **Zones** have a drawing canvas that is not yet wired into detection.
+- **No object detection.** Events are labelled `motion`; person/car classification happens on your
+  Frigate server. Review items are alerts by default; use `review.alerts.required_zones` to file
+  motion outside chosen zones as detections.
+- **No continuous recording.** Motion-triggered clips only, capped at 60 s each. The Review page's
+  Motion tab shows the cameras live rather than scrubbing recorded motion.
+- **MQTT settings persist but are not consumed.** Nothing is published.
 - **The web console is MJPEG** at detect resolution — no WebRTC or MSE.
 - **No authentication** on the HTTP API (see warning above).
 

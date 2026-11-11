@@ -299,7 +299,9 @@ private fun AnimatedEventCard(event: EventEntity, now: Long, wide: Boolean, onCl
             .height(96.dp)
             .aspectRatio(16f / 9f)
             .clip(if (wide) RoundedLg else RoundedCornerShape(4.dp))
-            .background(FrigateTheme.colors.backgroundAlt)
+            // Dark in both themes, like the video it stands in for, so the white
+            // time label stays readable when there is no snapshot.
+            .background(Color(0xFF171717))
             .clickable(onClick = onClick)
     ) {
         if (snapshot != null) {
@@ -313,7 +315,7 @@ private fun AnimatedEventCard(event: EventEntity, now: Long, wide: Boolean, onCl
             Icon(
                 Icons.Filled.Sensors,
                 contentDescription = null,
-                tint = FrigateTheme.colors.secondaryForeground,
+                tint = Color(0xFF6B6B6B),
                 modifier = Modifier.align(Alignment.Center).size(24.dp)
             )
         }
