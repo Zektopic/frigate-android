@@ -1,6 +1,5 @@
 package com.zektopic.frigate
 
-import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
@@ -14,7 +13,16 @@ import com.zektopic.frigate.data.CameraConfigEntity
 import com.zektopic.frigate.data.EventEntity
 import com.zektopic.frigate.data.NvrDao
 import com.zektopic.frigate.service.NvrService
-import com.zektopic.frigate.ui.dashboard.DashboardScreen
+import com.zektopic.frigate.data.AppPreferences
+import com.zektopic.frigate.data.RecordingStore
+import com.zektopic.frigate.data.SystemConfigEntity
+import com.zektopic.frigate.data.UiSettings
+import com.zektopic.frigate.data.YamlConfigParser
+import com.zektopic.frigate.service.NvrRunState
+import com.zektopic.frigate.ui.FrigateAppShell
+import com.zektopic.frigate.ui.NvrActions
+import com.zektopic.frigate.ui.NvrUiState
+import kotlinx.coroutines.flow.flowOf
 import com.zektopic.frigate.ui.theme.FrigateAndroidTheme
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
@@ -81,40 +89,49 @@ class MainActivity : ComponentActivity() {
             maybeAskToIgnoreBatteryOptimizations()
         }
 
-        setContent {
-            FrigateAndroidTheme {
-                val cameraConfigs by nvrDao.getAllCameraConfigsFlow().collectAsState(initial = emptyList())
-                val events by nvrDao.getAllEventsFlow().collectAsState(initial = emptyList())
-                val systemConfig by nvrDao.getSystemConfigFlow().collectAsState(initial = null)
-                var isServiceRunning by remember { mutableStateOf(false) }
-                val latestFrames = remember { mutableStateMapOf<String, Bitmap>() }
-                var streamStates by remember { mutableStateOf<Map<String, com.zektopic.frigate.media.StreamState>>(emptyMap()) }
+        openReviewRequest = if (intent?.getBooleanExtra(EXTRA_OPEN_REVIEW, false) == true) 1 else 0
+        val appPreferences = AppPreferences(applicationContext)
 
-                // Periodically check if background service is running and auto-start it
+        setContent {
+            val uiSettings by appPreferences.uiSettings.collectAsState(initial = UiSettings())
+            FrigateAndroidTheme(themeMode = uiSettings.themeMode) {
+                val cameraConfigs by nvrDao.getAllCameraConfigsFlow().collectAsState(initial = emptyList())
+                val events by nvrDao.getRecentEventsFlow(MAX_EVENTS_IN_UI).collectAsState(initial = emptyList())
+                val systemConfig by nvrDao.getSystemConfigFlow().collectAsState(initial = null)
+                val latestFrames = remember { mutableStateMapOf<String, Bitmap>() }
+                val service = nvrService
+
+                // The bound service's state, or an empty value while nothing is bound.
+                val streamStates by remember(service) { service?.streamStates ?: flowOf(emptyMap()) }
+                    .collectAsState(initial = emptyMap())
+                val activeMotion by remember(service) { service?.activeMotion ?: flowOf(emptySet()) }
+                    .collectAsState(initial = emptySet())
+                val activeAlerts by remember(service) { service?.activeAlerts ?: flowOf(emptySet()) }
+                    .collectAsState(initial = emptySet())
+                val overBudget by remember(service) { service?.camerasOverBudget ?: flowOf(emptyList()) }
+                    .collectAsState(initial = emptyList())
+                val stats by remember(service) { service?.stats ?: flowOf(emptyList()) }
+                    .collectAsState(initial = emptyList())
+                val isServiceRunning by remember(service) { service?.running ?: flowOf(false) }
+                    .collectAsState(initial = false)
+
+                // Start the NVR with the app, unless the user stopped it themselves.
                 LaunchedEffect(Unit) {
-                    startNvrService()
-                    while (true) {
-                        isServiceRunning = isServiceRunning(NvrService::class.java)
-                        kotlinx.coroutines.delay(1000)
-                    }
+                    if (NvrRunState.shouldRun(this@MainActivity)) startNvrService()
                 }
 
                 // Collect frames from active bound service
-                LaunchedEffect(nvrService) {
-                    nvrService?.let { service ->
-                        service.frameFlow.collect { (cameraId, bitmap) ->
-                            latestFrames[cameraId] = bitmap
-                        }
-                    } ?: latestFrames.clear()
+                LaunchedEffect(service) {
+                    if (service == null) {
+                        latestFrames.clear()
+                    } else {
+                        service.frameFlow.collect { (cameraId, bitmap) -> latestFrames[cameraId] = bitmap }
+                    }
                 }
-
-                // Collect per-camera connection states from the bound service
-                LaunchedEffect(nvrService) {
-                    nvrService?.let { service ->
-                        service.streamStates.collect { states ->
-                            streamStates = states
-                        }
-                    } ?: run { streamStates = emptyMap() }
+                // A stopped stream leaves its last frame behind; drop frames for
+                // cameras that are no longer running so a tile cannot show a stale one.
+                LaunchedEffect(streamStates.keys) {
+                    latestFrames.keys.retainAll(streamStates.keys)
                 }
 
                 // Seed the default config exactly once, on genuine first run.
@@ -130,42 +147,76 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                DashboardScreen(
-                    cameraConfigs = cameraConfigs,
-                    events = events,
-                    systemConfig = systemConfig,
-                    latestFrames = latestFrames,
-                    streamStates = streamStates,
-                    onSaveConfig = { yamlText ->
-                        val parsedCameras = com.zektopic.frigate.data.YamlConfigParser.parseConfig(yamlText)
-                        // Atomic replace — the service never sees a momentary empty camera list
-                        nvrDao.applyConfig(
-                            com.zektopic.frigate.data.SystemConfigEntity(configYaml = yamlText),
-                            parsedCameras
-                        )
-                    },
-                    onAddMockCamera = {
-                        lifecycleScope.launch(Dispatchers.IO) {
-                            seedMockCameras()
+                val actions = remember(service) {
+                    object : NvrActions {
+                        override suspend fun saveConfig(yaml: String) {
+                            val parsedCameras = YamlConfigParser.parseConfig(yaml)
+                            // Atomic replace — the service never sees a momentary empty camera list
+                            nvrDao.applyConfig(SystemConfigEntity(configYaml = yaml), parsedCameras)
                         }
-                    },
-                    onTriggerTestNotification = {
-                        triggerTestAlertNotification()
-                    },
-                    onStartNvrService = {
-                        startNvrService()
-                    },
-                    onStopNvrService = {
-                        stopNvrService()
-                    },
-                    onClearAllRecordings = {
-                        // Files are deleted by the Storage section; clear the event log too
-                        nvrDao.deleteAllEvents()
-                    },
-                    isServiceRunning = isServiceRunning
+
+                        override fun startService() = startNvrService()
+                        override fun stopService() = stopNvrService()
+                        override fun sendTestNotification() = triggerTestAlertNotification()
+
+                        override suspend fun clearAllRecordings() {
+                            // Files are deleted by the Storage page; clear the event log too
+                            nvrDao.deleteAllEvents()
+                        }
+
+                        override fun setReviewed(eventIds: List<Long>, reviewed: Boolean) {
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                // SQLite caps bound variables per statement
+                                eventIds.chunked(500).forEach { nvrDao.setEventsReviewed(it, reviewed) }
+                            }
+                        }
+
+                        override fun deleteEvents(events: List<EventEntity>) {
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                val store = RecordingStore(applicationContext)
+                                for (event in events) {
+                                    event.videoPath?.let { store.delete(it) }
+                                    event.snapshotPath?.let { store.delete(it) }
+                                }
+                                events.map { it.id }.chunked(500).forEach { nvrDao.deleteEvents(it) }
+                            }
+                        }
+
+                        override fun motionBoxes(cameraId: String) = service?.getMotionBoxes(cameraId).orEmpty()
+
+                        override fun updateUi(settings: UiSettings) {
+                            lifecycleScope.launch { appPreferences.setUiSettings(settings) }
+                        }
+                    }
+                }
+
+                FrigateAppShell(
+                    state = NvrUiState(
+                        cameras = cameraConfigs,
+                        events = events,
+                        configYaml = systemConfig?.configYaml ?: "",
+                        streamStates = streamStates,
+                        activeMotion = activeMotion,
+                        activeAlerts = activeAlerts,
+                        camerasOverBudget = overBudget,
+                        stats = stats,
+                        isServiceRunning = isServiceRunning,
+                        ui = uiSettings
+                    ),
+                    frames = latestFrames,
+                    actions = actions,
+                    openReviewRequest = openReviewRequest
                 )
             }
         }
+    }
+
+    /** Bumped each time an alert notification is tapped, so the UI can react to each tap. */
+    private var openReviewRequest by mutableIntStateOf(0)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.getBooleanExtra(EXTRA_OPEN_REVIEW, false)) openReviewRequest++
     }
 
     private fun startNvrService() {
@@ -181,8 +232,8 @@ class MainActivity : ComponentActivity() {
     private fun stopNvrService() {
         // An explicit Stop also keeps BootReceiver from restarting it after a reboot
         com.zektopic.frigate.service.NvrRunState.setShouldRun(this, false)
-        val intent = Intent(this, NvrService::class.java)
-        stopService(intent)
+        // Through the binder when there is one: stopService cannot stop a bound service.
+        nvrService?.stopNvr() ?: stopService(Intent(this, NvrService::class.java))
     }
 
     /**
@@ -207,17 +258,6 @@ class MainActivity : ComponentActivity() {
         } catch (e: android.content.ActivityNotFoundException) {
             android.util.Log.w("MainActivity", "No screen to request the battery optimization exemption", e)
         }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun isServiceRunning(serviceClass: Class<*>): Boolean {
-        val manager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        for (service in manager.getRunningServices(Integer.MAX_VALUE)) {
-            if (serviceClass.name == service.service.className) {
-                return true
-            }
-        }
-        return false
     }
 
     private suspend fun seedMockCameras() {
@@ -375,8 +415,9 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 101) {
-            // Restart NVR service to pick up newly granted camera/notification permissions
-            startNvrService()
+            // Restart NVR service to pick up newly granted camera/notification permissions,
+            // but not if the user has stopped it: a permission dialog is not a request to start.
+            if (NvrRunState.shouldRun(this)) startNvrService()
             maybeAskToIgnoreBatteryOptimizations()
         }
     }
@@ -384,5 +425,8 @@ class MainActivity : ComponentActivity() {
     companion object {
         /** Set on the intent an alert notification opens, to land on the Review page. */
         const val EXTRA_OPEN_REVIEW = "open_review"
+
+        /** Newest events the UI observes; older ones stay on disk and in the API. */
+        private const val MAX_EVENTS_IN_UI = 500
     }
 }

@@ -28,7 +28,6 @@ class CameraYamlEditorTest {
             detectWidth = 1280,
             detectHeight = 720,
             fps = 5,
-            motionThresholdPercent = 3,
             retentionDays = 7f,
             enabled = true
         )
@@ -155,5 +154,189 @@ class CameraYamlEditorTest {
         for (edited in edits) {
             assertEquals(edited, 5, YamlConfigParser.parseMaxConcurrentStreams(edited))
         }
+    }
+
+    private val richYaml = """
+        cameras:
+          front:
+            ffmpeg:
+              inputs:
+                - path: rtsp://host:8554/front_sub
+                  roles: [detect]
+                - path: rtsp://user:pass@host:8554/front
+                  roles: [record]
+            snapshots:
+              enabled: false
+            motion:
+              threshold: 45
+              mask:
+                - 0,0,0.3,0,0.3,0.1
+            zones:
+              driveway:
+                coordinates: 0,0.5,1,0.5,1,1,0,1
+    """.trimIndent()
+
+    @Test
+    fun editingACameraKeepsEverythingTheWizardDoesNotShow() {
+        // Editing used to rewrite the whole camera block, dropping all of this.
+        val edited = CameraYamlEditor.upsertCamera(
+            richYaml,
+            CameraDraft(
+                originalId = "front",
+                name = "Front",
+                rtspUrl = "rtsp://user:pass@host:8554/front",
+                detectUrl = "rtsp://host:8554/front_sub",
+                fps = 8
+            )
+        )
+        val camera = YamlConfigParser.parseConfig(edited).single()
+        assertEquals(8, camera.fps)
+        assertEquals("rtsp://host:8554/front_sub", camera.detectRtspUrl)
+
+        val runtime = YamlConfigParser.parseRuntimeConfigs(edited).getValue("front")
+        assertEquals(listOf("driveway"), runtime.zones.map { it.name })
+        assertEquals(45, runtime.motion.threshold)
+        assertEquals(1, runtime.motion.masks.size)
+        assertEquals(false, CameraYamlEditor.readAllCameraFeatures(edited)["front"]?.snapshots)
+    }
+
+    @Test
+    fun aDetectSubstreamIsWrittenAsItsOwnInput() {
+        val yaml = CameraYamlEditor.upsertCamera(
+            baseYaml,
+            CameraDraft(name = "Porch", rtspUrl = "rtsp://h:8554/porch", detectUrl = "rtsp://h:8554/porch_sub")
+        )
+        val porch = YamlConfigParser.parseConfig(yaml).first { it.id == "porch" }
+        assertEquals("rtsp://h:8554/porch", porch.rtspUrl)
+        assertEquals("rtsp://h:8554/porch_sub", porch.detectRtspUrl)
+        assertEquals("rtsp://h:8554/porch_sub", porch.effectiveDetectUrl)
+    }
+
+    @Test
+    fun clearingTheSubstreamGoesBackToOneInput() {
+        val edited = CameraYamlEditor.upsertCamera(
+            richYaml,
+            CameraDraft(originalId = "front", name = "Front", rtspUrl = "rtsp://user:pass@host:8554/front", detectUrl = "")
+        )
+        assertEquals("", YamlConfigParser.parseConfig(edited).single().detectRtspUrl)
+    }
+
+    @Test
+    fun aRenamedCameraKeepsItsIdAndGainsAFriendlyName() {
+        val edited = CameraYamlEditor.upsertCamera(
+            baseYaml,
+            CameraDraft(originalId = "existing_cam", name = "Back Gate", rtspUrl = "rtsp://192.168.1.9:8554/existing_cam")
+        )
+        val camera = YamlConfigParser.parseConfig(edited).single()
+        assertEquals("existing_cam", camera.id)
+        assertEquals("Back Gate", camera.name)
+    }
+
+    @Test
+    fun cameraEnabledFlagRoundTrips() {
+        val off = CameraYamlEditor.setCameraEnabled(baseYaml, "existing_cam", false)
+        assertEquals(false, YamlConfigParser.parseConfig(off).single().isEnabled)
+        val on = CameraYamlEditor.setCameraEnabled(off, "existing_cam", true)
+        assertEquals(true, YamlConfigParser.parseConfig(on).single().isEnabled)
+    }
+
+    @Test
+    fun cameraMotionSettingsAreWrittenWithFrigatesKeys() {
+        val yaml = CameraYamlEditor.setMotion(baseYaml, "existing_cam", MotionDraft(threshold = 40, contourArea = 25, improveContrast = false))
+        val motion = YamlConfigParser.parseRuntimeConfigs(yaml).getValue("existing_cam").motion
+        assertEquals(40, motion.threshold)
+        assertEquals(25, motion.contourArea)
+        assertEquals(false, motion.improveContrast)
+    }
+
+    @Test
+    fun globalMotionSettingsApplyToEveryCameraAndReadBack() {
+        val draft = MotionDraft(threshold = 50, contourArea = 30, improveContrast = true)
+        val yaml = CameraYamlEditor.setMotion(baseYaml, null, draft)
+        assertEquals(draft, CameraYamlEditor.readGlobalMotion(yaml))
+        assertEquals(50, YamlConfigParser.parseRuntimeConfigs(yaml).getValue("existing_cam").motion.threshold)
+    }
+
+    @Test
+    fun savingMotionSettingsKeepsTheCamerasMasks() {
+        val yaml = CameraYamlEditor.setMotion(richYaml, "front", MotionDraft(threshold = 20))
+        val motion = YamlConfigParser.parseRuntimeConfigs(yaml).getValue("front").motion
+        assertEquals(20, motion.threshold)
+        assertEquals(1, motion.masks.size)
+    }
+
+    private val triangle = listOf(
+        com.zektopic.frigate.ai.RelPoint(0.1f, 0.1f),
+        com.zektopic.frigate.ai.RelPoint(0.9f, 0.1f),
+        com.zektopic.frigate.ai.RelPoint(0.5f, 0.75f)
+    )
+
+    @Test
+    fun zonesAreAddedReplacedAndRemoved() {
+        val added = CameraYamlEditor.setZone(baseYaml, "existing_cam", "Front Porch", triangle)
+        val zone = YamlConfigParser.parseRuntimeConfigs(added).getValue("existing_cam").zones.single()
+        assertEquals("front_porch", zone.name)
+        assertEquals(0.75f, zone.polygon[2].y, 0.0005f)
+
+        val removed = CameraYamlEditor.removeZone(added, "existing_cam", "front_porch")
+        assertTrue(YamlConfigParser.parseRuntimeConfigs(removed).getValue("existing_cam").zones.isEmpty())
+        assertFalse(removed.contains("zones"))
+    }
+
+    @Test
+    fun aZoneNeedsANameAndThreePoints() {
+        assertEquals(baseYaml, CameraYamlEditor.setZone(baseYaml, "existing_cam", "  ", triangle))
+        assertEquals(baseYaml, CameraYamlEditor.setZone(baseYaml, "existing_cam", "porch", triangle.take(2)))
+        assertEquals(baseYaml, CameraYamlEditor.setZone(baseYaml, "no_such_camera", "porch", triangle))
+    }
+
+    @Test
+    fun coordinatesAreWrittenCompactlyAndLocaleIndependent() {
+        assertEquals("0.1,0.1,0.9,0.1,0.5,0.75", CameraYamlEditor.coordinates(triangle))
+    }
+
+    @Test
+    fun motionMasksAreAppendedAndRemovedByKey() {
+        val one = CameraYamlEditor.addMotionMask(baseYaml, "existing_cam", triangle)
+        val two = CameraYamlEditor.addMotionMask(one, "existing_cam", triangle.map { it.copy(y = it.y / 2) })
+        val masks = CameraYamlEditor.readMotionMasks(two, "existing_cam", 640, 360)
+        assertEquals(listOf("0", "1"), masks.map { it.key })
+
+        val afterRemove = CameraYamlEditor.removeMotionMask(two, "existing_cam", "0")
+        val left = CameraYamlEditor.readMotionMasks(afterRemove, "existing_cam", 640, 360).single()
+        assertEquals("the second mask is the one that remains", 0.375f, left.polygon[2].y, 0.0005f)
+
+        val none = CameraYamlEditor.removeMotionMask(afterRemove, "existing_cam", "0")
+        assertTrue(CameraYamlEditor.readMotionMasks(none, "existing_cam", 640, 360).isEmpty())
+    }
+
+    @Test
+    fun aMaskAddedToASingleStringMaskKeepsTheOriginal() {
+        val yaml = baseYaml + "\n    motion:\n      mask: 0,0,0.3,0,0.3,0.1\n"
+        val added = CameraYamlEditor.addMotionMask(yaml, "existing_cam", triangle)
+        assertEquals(2, YamlConfigParser.parseRuntimeConfigs(added).getValue("existing_cam").motion.masks.size)
+    }
+
+    @Test
+    fun namedMasksStayNamed() {
+        val yaml = baseYaml + "\n    motion:\n      mask:\n        timestamp:\n          coordinates: 0,0,0.3,0,0.3,0.1\n"
+        val added = CameraYamlEditor.addMotionMask(yaml, "existing_cam", triangle)
+        val masks = CameraYamlEditor.readMotionMasks(added, "existing_cam", 640, 360)
+        assertEquals(listOf("timestamp", "mask_2"), masks.map { it.key })
+        val removed = CameraYamlEditor.removeMotionMask(added, "existing_cam", "timestamp")
+        assertEquals(listOf("mask_2"), CameraYamlEditor.readMotionMasks(removed, "existing_cam", 640, 360).map { it.key })
+    }
+
+    @Test
+    fun lowResourceAndStreamCapRoundTrip() {
+        val low = CameraYamlEditor.setLowResource(baseYaml, true)
+        assertTrue(YamlConfigParser.parseLowResource(low))
+        assertFalse(YamlConfigParser.parseLowResource(CameraYamlEditor.setLowResource(low, false)))
+
+        val capped = CameraYamlEditor.setMaxConcurrentStreams(baseYaml, 3)
+        assertEquals(3, YamlConfigParser.parseMaxConcurrentStreams(capped))
+        val auto = CameraYamlEditor.setMaxConcurrentStreams(capped, null)
+        assertNull(YamlConfigParser.parseMaxConcurrentStreams(auto))
+        assertFalse("an emptied android block is removed", auto.contains("android"))
     }
 }

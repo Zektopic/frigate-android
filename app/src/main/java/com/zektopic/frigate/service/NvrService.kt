@@ -108,6 +108,14 @@ class NvrService : Service(), LifecycleOwner {
     private val _camerasOverBudget = MutableStateFlow<List<String>>(emptyList())
     val camerasOverBudget = _camerasOverBudget.asStateFlow()
 
+    /**
+     * Whether the NVR is actually running. Not the same as the service existing: the
+     * activity binds with BIND_AUTO_CREATE, so the service is alive whenever the app
+     * is on screen, started or not.
+     */
+    private val _running = MutableStateFlow(false)
+    val running = _running.asStateFlow()
+
     private val _stats = MutableStateFlow<List<StatsSample>>(emptyList())
     val stats = _stats.asStateFlow()
     private val statsCollector = StatsCollector()
@@ -222,6 +230,7 @@ class NvrService : Service(), LifecycleOwner {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        _running.value = true
 
         // Show persistent status notification to run in background
         enterForeground(createStatusNotification("Initializing NVR streams..."))
@@ -234,6 +243,27 @@ class NvrService : Service(), LifecycleOwner {
         }
 
         return START_STICKY
+    }
+
+    /**
+     * Stop watching cameras. Must be called on the main thread.
+     *
+     * `stopService` alone does nothing while the activity is bound: Android keeps a
+     * bound service alive, so the streams kept running behind a UI that said they
+     * had stopped. This tears the pipeline down itself and then lets go.
+     */
+    fun stopNvr() {
+        if (!_running.value) return
+        _running.value = false
+        Log.i(tag, "Stopping NVR on request")
+        configJob?.cancel()
+        configJob = null
+        stopAllStreams()
+        val saved = clipRecorder.stopAll()
+        serviceScope.launch { closeAllEvents(saved) }
+        _stats.value = emptyList()
+        androidx.core.app.ServiceCompat.stopForeground(this, androidx.core.app.ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     /** Observe the camera table and the config together, and (re)start streams to match. */
@@ -641,6 +671,10 @@ class NvrService : Service(), LifecycleOwner {
         val memInfo = android.app.ActivityManager.MemoryInfo()
         val runtime = Runtime.getRuntime()
         while (serviceScope.isActive) {
+            if (!_running.value) {
+                delay(StatsCollector.SAMPLE_INTERVAL_MS)
+                continue
+            }
             am.getMemoryInfo(memInfo)
             val memoryPercent = if (memInfo.totalMem > 0)
                 100f * (memInfo.totalMem - memInfo.availMem) / memInfo.totalMem else 0f
