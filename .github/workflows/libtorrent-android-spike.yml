@@ -3,6 +3,9 @@ name: libtorrent Android spike
 # Builds spikes/libtorrent-android. Independent of the app build: nothing in
 # the Gradle project depends on the spike, and this only runs when it changes.
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
@@ -37,7 +40,7 @@ jobs:
     env:
       NDK_VERSION: 27.2.12479018  # r27c
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure Git safe directory
         run: git config --global --add safe.directory '*'
@@ -49,13 +52,23 @@ jobs:
           pipx install cmake==3.31.6
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install NDK ${{ env.NDK_VERSION }}
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK & NDK ${{ env.NDK_VERSION }}
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "ndk;${{ env.NDK_VERSION }}"
+
+      - name: Export ANDROID_NDK_HOME
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null || true
           test -f "$ANDROID_HOME/ndk/$NDK_VERSION/source.properties"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: spikes/libtorrent-android/.cache/downloads
           key: lt-spike-sources-${{ hashFiles('spikes/libtorrent-android/build.sh') }}
@@ -69,7 +82,7 @@ jobs:
         if: always()
         run: cat out/*/report.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report written" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: lt-spike-android-${{ matrix.abi }}-openssl-${{ matrix.openssl }}
@@ -85,7 +98,7 @@ jobs:
       matrix:
         openssl: ['on', 'off']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure Git safe directory
         run: git config --global --add safe.directory '*'
@@ -95,7 +108,7 @@ jobs:
           pipx install cmake==3.31.6
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: spikes/libtorrent-android/.cache/downloads
           key: lt-spike-sources-${{ hashFiles('spikes/libtorrent-android/build.sh') }}
